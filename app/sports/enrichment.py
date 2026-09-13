@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from urllib.parse import urlparse
 
 from .models import Event
@@ -7,7 +8,9 @@ from .odds import collect_bookmaker_odds
 from ..browser.research import browser_search_pages
 
 
-MAX_PAGE_CHARS = 14000
+MAX_PAGE_CHARS = 14_000
+MAX_RESEARCH_PAGES_PER_QUERY = 3
+RESEARCH_CONCURRENCY = 4
 ALLOWED_RESEARCH_DOMAINS = {
     "sports.ru",
     "championat.com",
@@ -55,33 +58,60 @@ def _queries(event: Event) -> list[tuple[str, str]]:
     ]
 
 
+async def _collect_category(
+    category: str,
+    query: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, list[tuple[str, str]], list[str]]:
+    async with semaphore:
+        try:
+            pages = await asyncio.wait_for(
+                browser_search_pages(query, max_pages=MAX_RESEARCH_PAGES_PER_QUERY),
+                timeout=25,
+            )
+            return category, pages, []
+        except Exception as exc:
+            return category, [], [f"{category}: {type(exc).__name__}: {exc}"]
+
+
 async def enrich_event(event: Event) -> Event:
-    """Collect broad opened-page sports evidence plus verified Russian bookmaker lines."""
+    """Collect sports evidence and verified Russian bookmaker lines.
+
+    Research categories run concurrently and each category has a hard timeout.
+    A slow/unavailable source is isolated instead of blocking the whole match.
+    """
     evidence: dict[str, str] = {}
     source_urls: list[str] = []
     errors: list[str] = []
 
-    for category, query in _queries(event):
-        try:
-            pages = await browser_search_pages(query, max_pages=5)
-        except Exception as exc:
-            errors.append(f"{category}: {type(exc).__name__}: {exc}")
-            continue
+    semaphore = asyncio.Semaphore(RESEARCH_CONCURRENCY)
+    tasks = [
+        _collect_category(category, query, semaphore)
+        for category, query in _queries(event)
+    ]
+    results = await asyncio.gather(*tasks)
 
+    for category, pages, category_errors in results:
+        errors.extend(category_errors)
         for url, text in pages:
             if not _valid_research_url(url) or not text.strip():
                 continue
             domain = urlparse(url).netloc.lower().removeprefix("www.")
-            # Keep more than one page per domain when it covers a different
-            # evidence category. This prevents one generic article from
-            # replacing form/H2H/lineup/statistics evidence.
             key = f"{category}:{domain}:{urlparse(url).path}"
             if key in evidence:
                 continue
             evidence[key] = text.strip()[:MAX_PAGE_CHARS]
             source_urls.append(url)
 
-    bookmaker_odds, odds_errors = await collect_bookmaker_odds(event)
+    try:
+        bookmaker_odds, odds_errors = await asyncio.wait_for(
+            collect_bookmaker_odds(event),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        bookmaker_odds, odds_errors = {}, ["bookmakers: timeout after 45 seconds"]
+    except Exception as exc:
+        bookmaker_odds, odds_errors = {}, [f"bookmakers: {type(exc).__name__}: {exc}"]
     errors.extend(odds_errors)
 
     metadata = dict(event.metadata)
