@@ -21,8 +21,10 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 4. BET разрешён только при достаточной фактической базе, конкретном подтверждённом рынке/коэффициенте российского БК и заметном математическом перевесе.
 5. implied probability = 1 / коэффициент. edge = estimated probability - implied probability. Фаворит сам по себе не является ставкой.
 6. confidence — уверенность именно в решении BET/WATCH/SKIP, а НЕ вероятность исхода.
-7. Для SKIP можно дать высокую уверенность, если причина объективна (например, линия отсутствует). Но при LOW качестве данных не используй 98–100 без очень сильной причины; обычно диапазон 80–92.
-8. Если источники расходятся по числу побед, пропущенным шайбам, месту в таблице или другому ключевому факту, НЕ выбирай одну версию молча. Спорный факт исключи из ключевых факторов, укажи расхождение в risks/data_gaps и снизь data_quality.
+7. При LOW качестве данных confidence обычно 80–92. Никогда не ставь 98–100 только потому, что данных мало или линия отсутствует.
+8. Если источники расходятся по ключевому факту, спорный факт исключи из факторов, укажи расхождение в risks/data_gaps и снизь data_quality.
+9. Если research_page_count=0, считай спортивное исследование НЕ выполненным. Не выдавай общие знания за факты. В этом случае verdict=SKIP, data_quality=LOW.
+10. Если bookmaker_count=0, verdict не может быть BET. Если спортивные данные интересны, но линии нет, можно выбрать WATCH; иначе SKIP.
 
 БУКМЕКЕРСКАЯ ЛИНИЯ
 - Используй только metadata, начинающиеся с bookmaker_.
@@ -33,6 +35,7 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 - Для LIVE нужна текущая LIVE-линия, а не prematch-коэффициент.
 
 ПОЛНОТА АНАЛИЗА
+Используй только реально присутствующие в metadata research_* и bookmaker_* данные.
 Старайся покрыть отдельными фактами:
 • Форма — последние матчи и результаты.
 • Дом/гости — если источник даёт такую статистику.
@@ -67,7 +70,7 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 
 Требования:
 - confidence — целое 0–100;
-- factors — 4–6 конкретных фактов, без общих фраз;
+- factors — 4–6 конкретных фактов только если они реально подтверждены; при нехватке данных лучше 1–3 факта, чем выдуманные;
 - risks — 2–5 конкретных рисков или противоречий;
 - data_gaps — 0–6 реально отсутствующих важных блоков;
 - market/odds/вероятности null, если они не подтверждены;
@@ -78,7 +81,7 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 def _fallback(error: str) -> dict:
     return {
         "verdict": "SKIP",
-        "confidence": 100,
+        "confidence": 90,
         "market": None,
         "odds": None,
         "odds_source": None,
@@ -118,6 +121,39 @@ def _parse_json(text: str) -> dict:
     return data
 
 
+def _normalize(data: dict, event: Event) -> dict:
+    result = dict(data)
+    try:
+        confidence = max(0, min(100, int(result.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0
+
+    quality = str(result.get("data_quality") or "LOW").upper()
+    research_pages = int(event.metadata.get("research_page_count", "0") or 0)
+    bookmaker_count = int(event.metadata.get("bookmaker_count", "0") or 0)
+
+    if research_pages == 0:
+        quality = "LOW"
+        result["verdict"] = "SKIP"
+        confidence = min(confidence, 90)
+    elif quality == "LOW":
+        confidence = min(confidence, 92)
+
+    if bookmaker_count == 0 and str(result.get("verdict", "SKIP")).upper() == "BET":
+        result["verdict"] = "WATCH"
+        confidence = min(confidence, 88)
+        result["market"] = None
+        result["odds"] = None
+        result["odds_source"] = None
+        result["estimated_probability"] = None
+        result["implied_probability"] = None
+        result["edge"] = None
+
+    result["confidence"] = confidence
+    result["data_quality"] = quality
+    return result
+
+
 async def analyze(events: list[Event]) -> dict:
     if not settings.openai_api_key:
         return _fallback("OPENAI_API_KEY не задан в .env")
@@ -148,7 +184,8 @@ async def analyze(events: list[Event]) -> dict:
             instructions=SYSTEM_PROMPT,
             input=json.dumps(payload, ensure_ascii=False),
         )
-        return _parse_json(response.output_text)
+        parsed = _parse_json(response.output_text)
+        return _normalize(parsed, events[0]) if events else parsed
     except AuthenticationError:
         return _fallback("AI API отклонил ключ: 401 Invalid token. Проверь OPENAI_API_KEY и не путай его с BOT_TOKEN.")
     except APIConnectionError:
