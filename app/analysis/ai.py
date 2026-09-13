@@ -21,9 +21,9 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 4. BET разрешён только при достаточной фактической базе, конкретном подтверждённом рынке/коэффициенте российского БК и заметном математическом перевесе.
 5. implied probability = 1 / коэффициент. edge = estimated probability - implied probability. Фаворит сам по себе не является ставкой.
 6. confidence — уверенность именно в решении BET/WATCH/SKIP, а НЕ вероятность исхода.
-7. При LOW качестве данных confidence обычно 80–92. Никогда не ставь 98–100 только потому, что данных мало или линия отсутствует.
+7. Не завышай confidence из-за отсутствия данных. При LOW максимум 85; при research_page_count=0 максимум 70.
 8. Если источники расходятся по ключевому факту, спорный факт исключи из факторов, укажи расхождение в risks/data_gaps и снизь data_quality.
-9. Если research_page_count=0, считай спортивное исследование НЕ выполненным. Не выдавай общие знания за факты. В этом случае verdict=SKIP, data_quality=LOW.
+9. Если research_page_count=0, спортивное исследование НЕ выполнено. verdict=SKIP, data_quality=LOW, confidence<=70.
 10. Если bookmaker_count=0, verdict не может быть BET. Если спортивные данные интересны, но линии нет, можно выбрать WATCH; иначе SKIP.
 
 БУКМЕКЕРСКАЯ ЛИНИЯ
@@ -81,7 +81,7 @@ SYSTEM_PROMPT = """Ты главный спортивный аналитик с�
 def _fallback(error: str) -> dict:
     return {
         "verdict": "SKIP",
-        "confidence": 90,
+        "confidence": 70,
         "market": None,
         "odds": None,
         "odds_source": None,
@@ -129,19 +129,25 @@ def _normalize(data: dict, event: Event) -> dict:
         confidence = 0
 
     quality = str(result.get("data_quality") or "LOW").upper()
-    research_pages = int(event.metadata.get("research_page_count", "0") or 0)
-    bookmaker_count = int(event.metadata.get("bookmaker_count", "0") or 0)
+    try:
+        research_pages = int(event.metadata.get("research_page_count", "0") or 0)
+    except (TypeError, ValueError):
+        research_pages = 0
+    try:
+        bookmaker_count = int(event.metadata.get("bookmaker_count", "0") or 0)
+    except (TypeError, ValueError):
+        bookmaker_count = 0
 
     if research_pages == 0:
         quality = "LOW"
         result["verdict"] = "SKIP"
-        confidence = min(confidence, 90)
+        confidence = min(confidence, 70)
     elif quality == "LOW":
-        confidence = min(confidence, 92)
+        confidence = min(confidence, 85)
 
     if bookmaker_count == 0 and str(result.get("verdict", "SKIP")).upper() == "BET":
         result["verdict"] = "WATCH"
-        confidence = min(confidence, 88)
+        confidence = min(confidence, 80)
         result["market"] = None
         result["odds"] = None
         result["odds_source"] = None
@@ -155,8 +161,18 @@ def _normalize(data: dict, event: Event) -> dict:
 
 
 async def analyze(events: list[Event]) -> dict:
+    if not events:
+        return _fallback("Нет матча для анализа")
     if not settings.openai_api_key:
         return _fallback("OPENAI_API_KEY не задан в .env")
+
+    # Do not spend an AI request on an event for which browser research failed.
+    try:
+        research_pages = int(events[0].metadata.get("research_page_count", "0") or 0)
+    except (TypeError, ValueError):
+        research_pages = 0
+    if research_pages == 0:
+        return _fallback("Браузерное исследование матча не получило ни одной страницы с фактическими данными.")
 
     client = AsyncOpenAI(
         api_key=settings.openai_api_key,
@@ -185,7 +201,7 @@ async def analyze(events: list[Event]) -> dict:
             input=json.dumps(payload, ensure_ascii=False),
         )
         parsed = _parse_json(response.output_text)
-        return _normalize(parsed, events[0]) if events else parsed
+        return _normalize(parsed, events[0])
     except AuthenticationError:
         return _fallback("AI API отклонил ключ: 401 Invalid token. Проверь OPENAI_API_KEY и не путай его с BOT_TOKEN.")
     except APIConnectionError:
