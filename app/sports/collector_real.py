@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from ..browser.research import browser_source_text
 from .models import Event, ResearchResult, Sport
@@ -10,36 +11,44 @@ from .sources import sources_for
 
 _DATE_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>2026)")
 _TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
-LIVE_WINDOW = timedelta(hours=3, minutes=15)
+_SCORE_RE = re.compile(r"\b\d{1,2}\s*[:\-]\s*\d{1,2}\b")
+LIVE_WORDS = ("live", "в эфире", "сейчас", "1-й период", "2-й период", "3-й период", "1 период", "2 период", "3 период", "перерыв", "овертайм")
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" -–—|·")
 
 
-def _is_live_time(start_time: datetime, now: datetime | None = None) -> bool:
-    now = now or datetime.now()
-    return start_time <= now <= start_time + LIVE_WINDOW and start_time.date() == now.date()
+def _now() -> datetime:
+    return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 
-def _allowed_for_mode(start_time: datetime, mode: str, now: datetime) -> bool:
+def _allowed_for_mode(start_time: datetime, mode: str, now: datetime, explicit_live: bool = False) -> bool:
     today = now.date()
     last_allowed = today + timedelta(days=2)
 
-    # We only show the three nearest calendar days: today, tomorrow, day after tomorrow.
     if start_time.date() < today or start_time.date() > last_allowed:
         return False
 
     if mode == "prematch":
-        # A match that already started/finished today is no longer PREMATCH.
         return start_time > now
 
+    # LIVE is never inferred merely from the scheduled start time. A source
+    # must explicitly show an in-progress marker and, ideally, a score.
     if mode == "live":
-        # A calendar entry is considered LIVE only while its start time is inside
-        # the conservative live window. Future matches are never marked LIVE.
-        return _is_live_time(start_time, now)
+        return explicit_live and start_time.date() == today
 
     return False
+
+
+def _is_explicit_live(lines: list[str], index: int) -> tuple[bool, str | None]:
+    window = " ".join(lines[max(0, index - 2): min(len(lines), index + 9)]).lower()
+    has_live_word = any(word in window for word in LIVE_WORDS)
+    score_match = _SCORE_RE.search(window)
+    if not has_live_word:
+        return False, None
+    return True, score_match.group(0).replace(" ", "") if score_match else None
 
 
 def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
@@ -47,7 +56,7 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
     events: list[Event] = []
     current_date: str | None = None
     separators = {"-", "–", "—"}
-    now = datetime.now()
+    now = _now()
 
     for i, line in enumerate(lines):
         date_match = _DATE_RE.fullmatch(line)
@@ -64,6 +73,9 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
                 break
             if nxt in {"Дата и время", "Хозяева", "Счет", "Гости"} or nxt in separators:
                 continue
+            # Do not mistake status/score labels for team names.
+            if nxt.lower() in {"завершен", "предстоящие", "live", "онлайн", "матч завершен"}:
+                continue
             candidates.append(nxt)
             if len(candidates) >= 2:
                 break
@@ -77,7 +89,8 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
         start_time = datetime.fromisoformat(
             f"{current_date}T{int(time_match.group(1)):02d}:{time_match.group(2)}"
         )
-        if not _allowed_for_mode(start_time, mode, now):
+        explicit_live, score = _is_explicit_live(lines, i)
+        if not _allowed_for_mode(start_time, mode, now, explicit_live):
             continue
 
         events.append(Event(
@@ -85,7 +98,8 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
             mode=mode,  # type: ignore[arg-type]
             name=f"{home} — {away}",
             start_time=start_time,
-            status="LIVE" if mode == "live" else None,
+            status="LIVE" if explicit_live else None,
+            score=score,
             source="Browser Web Research",
             url=url,
             metadata={"source_domain": urlparse(url).netloc},
@@ -97,7 +111,7 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
     lines = [_clean(x) for x in text.splitlines() if _clean(x)]
     events: list[Event] = []
     current_date: str | None = None
-    now = datetime.now()
+    now = _now()
 
     for i, line in enumerate(lines):
         match = re.search(r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*-\s*(\d{4}-\d{2}-\d{2})", line)
@@ -117,7 +131,7 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
             continue
         rest = re.sub(r"^(bo\d+|Bo\d+)\s*", "", line[tm.end():].strip())
         if not rest:
-            for nxt in lines[i + 1 : i + 4]:
+            for nxt in lines[i + 1 : i + 5]:
                 if nxt and not _TIME_RE.search(nxt):
                     rest = nxt
                     break
@@ -125,15 +139,19 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
             continue
 
         start_time = datetime.fromisoformat(f"{current_date}T{tm.group(1)}")
-        if not _allowed_for_mode(start_time, mode, now):
+        window = " ".join(lines[max(0, i - 2): min(len(lines), i + 7)]).lower()
+        explicit_live = any(word in window for word in LIVE_WORDS) and bool(_SCORE_RE.search(window))
+        if not _allowed_for_mode(start_time, mode, now, explicit_live):
             continue
 
+        score_match = _SCORE_RE.search(window)
         events.append(Event(
             sport=sport,
             mode=mode,  # type: ignore[arg-type]
             name=rest[:180],
             start_time=start_time,
-            status="LIVE" if mode == "live" else None,
+            status="LIVE" if explicit_live else None,
+            score=score_match.group(0).replace(" ", "") if score_match else None,
             source="Browser Web Research",
             url=url,
             metadata={"source_domain": urlparse(url).netloc},
@@ -144,7 +162,7 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
 async def collect(sport: Sport, mode: str) -> ResearchResult:
     events: list[Event] = []
     errors: list[str] = []
-    for source in sources_for(sport):
+    for source in sources_for(sport, mode):
         try:
             text = await browser_source_text(source.url)
             if sport == "khl":
@@ -154,9 +172,9 @@ async def collect(sport: Sport, mode: str) -> ResearchResult:
         except Exception as exc:
             errors.append(f"{source.name}: {type(exc).__name__}: {exc}")
 
-    unique: dict[tuple[str, str], Event] = {}
+    unique: dict[tuple[str, str, str], Event] = {}
     for event in events:
-        unique[(event.name, event.url or "")] = event
+        unique[(event.name, event.url or "", event.mode)] = event
     if not unique:
-        errors.append(f"{sport}: real source pages produced no parseable {mode} events")
+        errors.append(f"{sport}: real source pages produced no verified {mode} events")
     return ResearchResult(events=list(unique.values()), errors=errors)
