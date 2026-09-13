@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
 @dataclass(slots=True)
 class BrowserResearch:
-    """Browser-only acquisition layer.
-
-    Search is used only for discovery. Sports events must be read from the
-    actual source page before they can become confirmed events.
-    """
+    """Browser-only acquisition layer."""
 
     browser: Browser | None = None
     context: BrowserContext | None = None
@@ -101,3 +97,90 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
         finally:
             await context.close()
             await browser.close()
+
+
+async def browser_search_pages(
+    query: str,
+    max_pages: int = 5,
+    engine: str = "yandex",
+) -> list[tuple[str, str]]:
+    """Discover URLs with browser search, then open URLs and read their pages.
+
+    Search snippets are discarded. Only text returned by opened source pages
+    is returned to the caller.
+    """
+    urls = {
+        "yandex": "https://yandex.ru/search/?text=",
+        "google": "https://www.google.com/search?q=",
+    }
+    if engine not in urls:
+        raise ValueError(f"Unsupported browser search engine: {engine}")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/140 Safari/140"
+            ),
+        )
+        search_page = await context.new_page()
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        try:
+            await search_page.goto(
+                urls[engine] + quote_plus(query),
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            await search_page.wait_for_timeout(1000)
+            links = await search_page.locator("a").evaluate_all(
+                "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
+            )
+
+            blocked_hosts = {
+                "yandex.ru",
+                "www.yandex.ru",
+                "google.com",
+                "www.google.com",
+                "youtube.com",
+                "www.youtube.com",
+            }
+            candidates: list[str] = []
+            for item in links:
+                url = (item.get("href") or "").strip()
+                if not url.startswith("http"):
+                    continue
+                parsed = urlparse(url)
+                if parsed.netloc.lower() in blocked_hosts:
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                candidates.append(url)
+                if len(candidates) >= max_pages * 3:
+                    break
+
+            page = await context.new_page()
+            try:
+                for url in candidates:
+                    if len(result) >= max_pages:
+                        break
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                        await page.wait_for_timeout(700)
+                        text = await page.locator("body").inner_text(timeout=10_000)
+                        if text and len(text.strip()) >= 200:
+                            result.append((url, text))
+                    except Exception:
+                        continue
+            finally:
+                await page.close()
+        finally:
+            await search_page.close()
+            await context.close()
+            await browser.close()
+
+    return result
