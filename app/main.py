@@ -50,18 +50,18 @@ def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
             )
         ])
     rows.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"collect:{sport}:{mode}"),
+        InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"collect:{sport}:{mode}"),
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sport:{sport}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def event_menu(sport: str, mode: str, event) -> InlineKeyboardMarkup:
+def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup:
     rows = []
     if event.url:
         rows.append([InlineKeyboardButton(text="🌐 Открыть источник", url=event.url)])
     rows.append([
-        InlineKeyboardButton(text="🔄 Обновить матч", callback_data=f"event:{sport}:{mode}:refresh"),
+        InlineKeyboardButton(text="🔄 Обновить матч", callback_data=f"event:{sport}:{mode}:{index}"),
         InlineKeyboardButton(text="⬅️ К матчам", callback_data=f"collect:{sport}:{mode}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -148,13 +148,10 @@ async def select_event(callback: CallbackQuery) -> None:
         )
         return
 
-    if index_text == "refresh":
+    try:
+        index = int(index_text)
+    except ValueError:
         index = 0
-    else:
-        try:
-            index = int(index_text)
-        except ValueError:
-            index = 0
 
     if index >= len(result.events):
         await callback.message.edit_text(
@@ -179,7 +176,7 @@ async def select_event(callback: CallbackQuery) -> None:
         f"📌 {escape(status_text)}{score_text}\n\n"
         f"<b>AI-анализ:</b>\n{escape(analysis[:3500])}"
     )
-    await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event))
+    await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event, index))
 
 
 @dp.callback_query(F.data.startswith("mode:"))
