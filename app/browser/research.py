@@ -13,13 +13,16 @@ PAGE_TIMEOUT_MS = 8_000
 
 @dataclass(slots=True)
 class BrowserResearch:
-    """Browser-only acquisition layer."""
+    """Reusable browser-only acquisition layer."""
 
     browser: Browser | None = None
     context: BrowserContext | None = None
     _playwright = None
+    _lock: asyncio.Lock | None = None
 
     async def start(self) -> None:
+        if self.browser and self.context:
+            return
         self._playwright = await async_playwright().start()
         self.browser = await self._playwright.chromium.launch(headless=True)
         self.context = await self.browser.new_context(
@@ -30,18 +33,22 @@ class BrowserResearch:
                 "AppleWebKit/537.36 Chrome/140 Safari/537.36"
             ),
         )
+        self._lock = asyncio.Lock()
 
     async def close(self) -> None:
         if self.context:
             await self.context.close()
+            self.context = None
         if self.browser:
             await self.browser.close()
+            self.browser = None
         if self._playwright:
             await self._playwright.stop()
+            self._playwright = None
 
     async def open(self, url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> Page:
-        if not self.context:
-            raise RuntimeError("BrowserResearch is not started")
+        await self.start()
+        assert self.context is not None
         page = await self.context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         return page
@@ -54,30 +61,36 @@ class BrowserResearch:
             await page.close()
 
 
+_shared: BrowserResearch | None = None
+_shared_guard = asyncio.Lock()
+
+
+async def _get_shared() -> BrowserResearch:
+    global _shared
+    async with _shared_guard:
+        if _shared is None:
+            _shared = BrowserResearch()
+            await _shared.start()
+        return _shared
+
+
 async def browser_source_text(url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> str:
-    """Read visible text of a real source page through Playwright."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
-            ),
-        )
-        page = await context.new_page()
+    """Read visible text from a real page using one reusable Playwright browser."""
+    research = await _get_shared()
+    lock = research._lock
+    if lock is None:
+        raise RuntimeError("Browser research lock is not initialized")
+    async with lock:
+        page = await research.open(url, timeout_ms)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             await page.wait_for_timeout(500)
             return await page.locator("body").inner_text(timeout=timeout_ms)
         finally:
-            await context.close()
-            await browser.close()
+            await page.close()
 
 
 async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, str]]:
-    """Browser search for discovery only; never treats search links as matches."""
+    """Browser search for discovery only; search results themselves are never evidence."""
     urls = {
         "yandex": "https://yandex.ru/search/?text=",
         "google": "https://www.google.com/search?q=",
@@ -85,23 +98,21 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
     if engine not in urls:
         raise ValueError(f"Unsupported browser search engine: {engine}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
-        page = await context.new_page()
+    research = await _get_shared()
+    lock = research._lock
+    if lock is None or research.context is None:
+        raise RuntimeError("Browser research is not initialized")
+    async with lock:
+        page = await research.context.new_page()
         try:
-            await page.goto(
-                urls[engine] + quote_plus(query),
-                wait_until="domcontentloaded",
-                timeout=SEARCH_TIMEOUT_MS,
-            )
+            await page.goto(urls[engine] + quote_plus(query), wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
+            await page.wait_for_timeout(400)
             links = await page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
             )
             return [x for x in links if x.get("title") and x.get("href")][:30]
         finally:
-            await context.close()
-            await browser.close()
+            await page.close()
 
 
 async def _browser_search_pages_engine(
@@ -116,17 +127,13 @@ async def _browser_search_pages_engine(
     if engine not in urls:
         raise ValueError(f"Unsupported browser search engine: {engine}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
-            ),
-        )
-        search_page = await context.new_page()
+    research = await _get_shared()
+    lock = research._lock
+    if lock is None or research.context is None:
+        raise RuntimeError("Browser research is not initialized")
+
+    async with lock:
+        search_page = await research.context.new_page()
         result: list[tuple[str, str]] = []
         seen: set[str] = set()
         try:
@@ -139,45 +146,41 @@ async def _browser_search_pages_engine(
             links = await search_page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
             )
-
-            blocked_hosts = {
-                "yandex.ru", "www.yandex.ru", "google.com", "www.google.com",
-                "youtube.com", "www.youtube.com",
-            }
-            candidates: list[str] = []
-            for item in links:
-                url = (item.get("href") or "").strip()
-                if not url.startswith("http"):
-                    continue
-                parsed = urlparse(url)
-                if parsed.netloc.lower() in blocked_hosts:
-                    continue
-                if url in seen:
-                    continue
-                seen.add(url)
-                candidates.append(url)
-                if len(candidates) >= max_pages * 3:
-                    break
-
-            page = await context.new_page()
-            try:
-                for url in candidates:
-                    if len(result) >= max_pages:
-                        break
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                        await page.wait_for_timeout(350)
-                        text = await page.locator("body").inner_text(timeout=PAGE_TIMEOUT_MS)
-                        if text and len(text.strip()) >= 200:
-                            result.append((url, text))
-                    except Exception:
-                        continue
-            finally:
-                await page.close()
         finally:
             await search_page.close()
-            await context.close()
-            await browser.close()
+
+        blocked_hosts = {
+            "yandex.ru", "www.yandex.ru", "google.com", "www.google.com",
+            "youtube.com", "www.youtube.com",
+        }
+        candidates: list[str] = []
+        for item in links:
+            url = (item.get("href") or "").strip()
+            if not url.startswith("http"):
+                continue
+            parsed = urlparse(url)
+            if parsed.netloc.lower() in blocked_hosts or url in seen:
+                continue
+            seen.add(url)
+            candidates.append(url)
+            if len(candidates) >= max_pages * 3:
+                break
+
+        page = await research.context.new_page()
+        try:
+            for url in candidates:
+                if len(result) >= max_pages:
+                    break
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                    await page.wait_for_timeout(350)
+                    text = await page.locator("body").inner_text(timeout=PAGE_TIMEOUT_MS)
+                    if text and len(text.strip()) >= 200:
+                        result.append((url, text))
+                except Exception:
+                    continue
+        finally:
+            await page.close()
 
     return result
 
@@ -187,26 +190,11 @@ async def browser_search_pages(
     max_pages: int = 3,
     engine: str = "yandex",
 ) -> list[tuple[str, str]]:
-    """Discover URLs and open real pages with strict time bounds.
-
-    One unavailable site must not block a Telegram request for minutes.
-    """
-    result = await _browser_search_pages_engine(query, max_pages, engine)
-    if len(result) < max(1, max_pages // 2):
-        fallback_engine = "google" if engine == "yandex" else "yandex"
-        try:
-            extra = await asyncio.wait_for(
-                _browser_search_pages_engine(query, max_pages, fallback_engine),
-                timeout=SEARCH_TIMEOUT_MS / 1000 * 2,
-            )
-        except Exception:
-            extra = []
-        seen = {url for url, _ in result}
-        for item in extra:
-            if item[0] in seen:
-                continue
-            result.append(item)
-            seen.add(item[0])
-            if len(result) >= max_pages:
-                break
-    return result[:max_pages]
+    """Discover and open real pages with bounded time and a reusable browser."""
+    try:
+        return await asyncio.wait_for(
+            _browser_search_pages_engine(query, max_pages, engine),
+            timeout=max(20, SEARCH_TIMEOUT_MS / 1000 + PAGE_TIMEOUT_MS / 1000 * max_pages + 3),
+        )
+    except Exception:
+        return []
