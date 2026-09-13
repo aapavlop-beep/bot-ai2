@@ -115,11 +115,7 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
             await page.close()
 
 
-async def _browser_search_pages_engine(
-    query: str,
-    max_pages: int,
-    engine: str,
-) -> list[tuple[str, str]]:
+async def _browser_search_pages_engine(query: str, max_pages: int, engine: str) -> list[tuple[str, str]]:
     urls = {
         "yandex": "https://yandex.ru/search/?text=",
         "google": "https://www.google.com/search?q=",
@@ -134,14 +130,8 @@ async def _browser_search_pages_engine(
 
     async with lock:
         search_page = await research.context.new_page()
-        result: list[tuple[str, str]] = []
-        seen: set[str] = set()
         try:
-            await search_page.goto(
-                urls[engine] + quote_plus(query),
-                wait_until="domcontentloaded",
-                timeout=SEARCH_TIMEOUT_MS,
-            )
+            await search_page.goto(urls[engine] + quote_plus(query), wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
             await search_page.wait_for_timeout(400)
             links = await search_page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
@@ -149,11 +139,9 @@ async def _browser_search_pages_engine(
         finally:
             await search_page.close()
 
-        blocked_hosts = {
-            "yandex.ru", "www.yandex.ru", "google.com", "www.google.com",
-            "youtube.com", "www.youtube.com",
-        }
+        blocked_hosts = {"yandex.ru", "www.yandex.ru", "google.com", "www.google.com", "youtube.com", "www.youtube.com"}
         candidates: list[str] = []
+        seen: set[str] = set()
         for item in links:
             url = (item.get("href") or "").strip()
             if not url.startswith("http"):
@@ -166,6 +154,7 @@ async def _browser_search_pages_engine(
             if len(candidates) >= max_pages * 3:
                 break
 
+        result: list[tuple[str, str]] = []
         page = await research.context.new_page()
         try:
             for url in candidates:
@@ -185,16 +174,15 @@ async def _browser_search_pages_engine(
     return result
 
 
-async def browser_search_pages(
-    query: str,
-    max_pages: int = 3,
-    engine: str = "yandex",
-) -> list[tuple[str, str]]:
+async def browser_search_pages(query: str, max_pages: int = 3, engine: str = "yandex") -> list[tuple[str, str]]:
     """Discover and open real pages with bounded time and a reusable browser."""
+    # Search itself can take 8s; each candidate page can take up to 8s.
+    # Leave enough budget for the requested number of real pages.
+    timeout = max(30, 12 + 10 * max_pages)
     try:
         return await asyncio.wait_for(
             _browser_search_pages_engine(query, max_pages, engine),
-            timeout=max(20, SEARCH_TIMEOUT_MS / 1000 + PAGE_TIMEOUT_MS / 1000 * max_pages + 3),
+            timeout=timeout,
         )
     except Exception:
         return []
