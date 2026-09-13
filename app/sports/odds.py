@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from urllib.parse import urlparse
 
@@ -87,29 +88,30 @@ def _odds_lines(text: str, event: Event) -> str:
             break
 
     compact = "\n".join(result)[:7000]
-    # A bookmaker page counts as a confirmed line only when the opened page
-    # actually exposes at least one decimal coefficient in the match context.
     if not _ODDS_RE.search(compact):
         return ""
     return compact
 
 
-async def collect_bookmaker_odds(event: Event) -> tuple[dict[str, str], list[str]]:
-    """Find official Russian bookmaker event pages and return only verified odds."""
-    date_text = event.start_time.strftime("%d.%m.%Y") if event.start_time else ""
-    errors: list[str] = []
-    found: dict[str, str] = {}
-
-    for bookmaker, domain in BOOKMAKERS:
-        # Search several formulations because bookmaker sites often index the
-        # event page under a different team order or league label.
+async def _collect_bookmaker(
+    event: Event,
+    bookmaker: str,
+    domain: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, str | None, list[str]]:
+    async with semaphore:
+        date_text = event.start_time.strftime("%d.%m.%Y") if event.start_time else ""
+        errors: list[str] = []
         queries = (
             f'site:{domain} "{event.name}" {date_text}',
             f'site:{domain} "{_team_tokens(event)[0]}" "{_team_tokens(event)[1]}"',
         )
         for query in queries:
             try:
-                pages = await browser_search_pages(query, max_pages=5)
+                pages = await asyncio.wait_for(
+                    browser_search_pages(query, max_pages=2),
+                    timeout=20,
+                )
             except Exception as exc:
                 errors.append(f"{bookmaker}: {type(exc).__name__}: {exc}")
                 continue
@@ -120,11 +122,22 @@ async def collect_bookmaker_odds(event: Event) -> tuple[dict[str, str], list[str
                 if not _contains_match(text, event):
                     continue
                 compact = _odds_lines(text, event)
-                if not compact:
-                    continue
-                found[bookmaker] = f"URL: {url}\n{compact}"
-                break
-            if bookmaker in found:
-                break
+                if compact:
+                    return bookmaker, f"URL: {url}\n{compact}", errors
 
+        return bookmaker, None, errors
+
+
+async def collect_bookmaker_odds(event: Event) -> tuple[dict[str, str], list[str]]:
+    """Find official Russian bookmaker event pages in parallel and verify odds."""
+    found: dict[str, str] = {}
+    errors: list[str] = []
+    semaphore = asyncio.Semaphore(4)
+    results = await asyncio.gather(
+        *(_collect_bookmaker(event, bookmaker, domain, semaphore) for bookmaker, domain in BOOKMAKERS)
+    )
+    for bookmaker, text, bookmaker_errors in results:
+        errors.extend(bookmaker_errors)
+        if text:
+            found[bookmaker] = text
     return found, errors
