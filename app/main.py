@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from html import escape
 
 from aiogram import Bot, Dispatcher, F
@@ -39,16 +40,49 @@ def sport_menu(sport: str) -> InlineKeyboardMarkup:
     )
 
 
+def _day_group(event, now: datetime) -> str:
+    if not event.start_time:
+        return "other"
+    day = event.start_time.date()
+    if day == now.date():
+        return "today"
+    if day == (now + timedelta(days=1)).date():
+        return "tomorrow"
+    if day == (now + timedelta(days=2)).date():
+        return "day_after"
+    return "other"
+
+
 def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
     rows = []
-    for index, event in enumerate(events[:15]):
-        live = "🔴 " if event.status == "LIVE" else ""
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{live}{event.name[:55]}",
-                callback_data=f"event:{sport}:{mode}:{index}",
-            )
-        ])
+    now = datetime.now()
+    grouped = {"today": [], "tomorrow": [], "day_after": []}
+
+    indexed_events = list(enumerate(events[:15]))
+    for index, event in indexed_events:
+        group = _day_group(event, now)
+        if group in grouped:
+            grouped[group].append((index, event))
+
+    labels = {
+        "today": "📅 СЕГОДНЯ",
+        "tomorrow": "📅 ЗАВТРА",
+        "day_after": "📅 ПОСЛЕЗАВТРА",
+    }
+    for group in ("today", "tomorrow", "day_after"):
+        items = grouped[group]
+        if not items:
+            continue
+        rows.append([InlineKeyboardButton(text=labels[group], callback_data=f"noop:{sport}:{mode}:{group}")])
+        for index, event in items:
+            live = "🔴 " if event.status == "LIVE" else ""
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"{live}{event.name[:55]}",
+                    callback_data=f"event:{sport}:{mode}:{index}",
+                )
+            ])
+
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"collect:{sport}:{mode}"),
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sport:{sport}"),
@@ -65,6 +99,32 @@ def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup
         InlineKeyboardButton(text="⬅️ К матчам", callback_data=f"collect:{sport}:{mode}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_event_list(events, mode: str) -> list[str]:
+    now = datetime.now()
+    grouped: dict[str, list] = {"today": [], "tomorrow": [], "day_after": []}
+    for event in events[:15]:
+        group = _day_group(event, now)
+        if group in grouped:
+            grouped[group].append(event)
+
+    labels = {
+        "today": "📅 <b>СЕГОДНЯ</b>",
+        "tomorrow": "📅 <b>ЗАВТРА</b>",
+        "day_after": "📅 <b>ПОСЛЕЗАВТРА</b>",
+    }
+    lines: list[str] = []
+    for group in ("today", "tomorrow", "day_after"):
+        if not grouped[group]:
+            continue
+        lines.append(labels[group])
+        for event in grouped[group]:
+            time_text = event.start_time.strftime("%H:%M") if event.start_time else "время н/д"
+            live = " 🔴 LIVE" if event.status == "LIVE" else ""
+            lines.append(f"• {escape(event.name[:180])} — {time_text}{live}")
+        lines.append("")
+    return lines
 
 
 @dp.message(CommandStart())
@@ -99,6 +159,11 @@ async def select_sport(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("noop:"))
+async def noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("collect:"))
 async def collect_sport(callback: CallbackQuery) -> None:
     _, sport, mode = callback.data.split(":", 2)
@@ -119,15 +184,20 @@ async def collect_sport(callback: CallbackQuery) -> None:
         )
         return
 
-    lines = [f"<b>{escape(title)} — {escape(mode.upper())}</b>", "", "Подтверждённые матчи из источников:"]
-    for event in result.events[:15]:
-        time_text = event.start_time.strftime("%d.%m %H:%M") if event.start_time else "время н/д"
-        live = " 🔴 LIVE" if event.status == "LIVE" else ""
-        lines.append(f"• {escape(event.name[:180])} — {time_text}{live}")
-    lines.append("\nНажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
+    events = sorted(
+        result.events,
+        key=lambda event: event.start_time or datetime.max,
+    )
+    lines = [
+        f"<b>{escape(title)} — {escape(mode.upper())}</b>",
+        "",
+        "Подтверждённые матчи из источников:",
+    ]
+    lines.extend(_format_event_list(events, mode))
+    lines.append("Нажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
     await callback.message.edit_text(
         "\n".join(lines),
-        reply_markup=event_list_menu(sport, mode, result.events),
+        reply_markup=event_list_menu(sport, mode, events),
     )
 
 
@@ -148,19 +218,23 @@ async def select_event(callback: CallbackQuery) -> None:
         )
         return
 
+    events = sorted(
+        result.events,
+        key=lambda event: event.start_time or datetime.max,
+    )
     try:
         index = int(index_text)
     except ValueError:
         index = 0
 
-    if index >= len(result.events):
+    if index >= len(events):
         await callback.message.edit_text(
             f"<b>{escape(title)}</b>\n\nСписок матчей изменился. Нажмите «К матчам» и выберите матч заново.",
             reply_markup=sport_menu(sport),
         )
         return
 
-    event = result.events[index]
+    event = events[index]
     time_text = event.start_time.strftime("%d.%m.%Y %H:%M") if event.start_time else "время н/д"
     status_text = event.status or "PREMATCH"
     score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
