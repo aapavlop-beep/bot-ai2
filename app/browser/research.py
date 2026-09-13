@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from urllib.parse import quote_plus, urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+
+
+SEARCH_TIMEOUT_MS = 8_000
+PAGE_TIMEOUT_MS = 8_000
 
 
 @dataclass(slots=True)
@@ -34,14 +39,14 @@ class BrowserResearch:
         if self._playwright:
             await self._playwright.stop()
 
-    async def open(self, url: str, timeout_ms: int = 20_000) -> Page:
+    async def open(self, url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> Page:
         if not self.context:
             raise RuntimeError("BrowserResearch is not started")
         page = await self.context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         return page
 
-    async def text(self, url: str, timeout_ms: int = 20_000) -> str:
+    async def text(self, url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> str:
         page = await self.open(url, timeout_ms)
         try:
             return await page.locator("body").inner_text(timeout=timeout_ms)
@@ -49,8 +54,8 @@ class BrowserResearch:
             await page.close()
 
 
-async def browser_source_text(url: str, timeout_ms: int = 30_000) -> str:
-    """Read the visible text of a real source page through Playwright."""
+async def browser_source_text(url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> str:
+    """Read visible text of a real source page through Playwright."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -58,13 +63,13 @@ async def browser_source_text(url: str, timeout_ms: int = 30_000) -> str:
             timezone_id="Europe/Moscow",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/140 Safari/140"
+                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
             ),
         )
         page = await context.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(500)
             return await page.locator("body").inner_text(timeout=timeout_ms)
         finally:
             await context.close()
@@ -82,13 +87,13 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(locale="ru-RU")
+        context = await browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
         page = await context.new_page()
         try:
             await page.goto(
                 urls[engine] + quote_plus(query),
                 wait_until="domcontentloaded",
-                timeout=20_000,
+                timeout=SEARCH_TIMEOUT_MS,
             )
             links = await page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
@@ -118,7 +123,7 @@ async def _browser_search_pages_engine(
             timezone_id="Europe/Moscow",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/140 Safari/140"
+                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
             ),
         )
         search_page = await context.new_page()
@@ -128,20 +133,16 @@ async def _browser_search_pages_engine(
             await search_page.goto(
                 urls[engine] + quote_plus(query),
                 wait_until="domcontentloaded",
-                timeout=20_000,
+                timeout=SEARCH_TIMEOUT_MS,
             )
-            await search_page.wait_for_timeout(1000)
+            await search_page.wait_for_timeout(400)
             links = await search_page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
             )
 
             blocked_hosts = {
-                "yandex.ru",
-                "www.yandex.ru",
-                "google.com",
-                "www.google.com",
-                "youtube.com",
-                "www.youtube.com",
+                "yandex.ru", "www.yandex.ru", "google.com", "www.google.com",
+                "youtube.com", "www.youtube.com",
             }
             candidates: list[str] = []
             for item in links:
@@ -155,7 +156,7 @@ async def _browser_search_pages_engine(
                     continue
                 seen.add(url)
                 candidates.append(url)
-                if len(candidates) >= max_pages * 4:
+                if len(candidates) >= max_pages * 3:
                     break
 
             page = await context.new_page()
@@ -164,9 +165,9 @@ async def _browser_search_pages_engine(
                     if len(result) >= max_pages:
                         break
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-                        await page.wait_for_timeout(700)
-                        text = await page.locator("body").inner_text(timeout=10_000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                        await page.wait_for_timeout(350)
+                        text = await page.locator("body").inner_text(timeout=PAGE_TIMEOUT_MS)
                         if text and len(text.strip()) >= 200:
                             result.append((url, text))
                     except Exception:
@@ -183,20 +184,21 @@ async def _browser_search_pages_engine(
 
 async def browser_search_pages(
     query: str,
-    max_pages: int = 5,
+    max_pages: int = 3,
     engine: str = "yandex",
 ) -> list[tuple[str, str]]:
-    """Discover URLs with browser search, then open real pages and read them.
+    """Discover URLs and open real pages with strict time bounds.
 
-    Search snippets are discarded. If Yandex returns too little usable material,
-    Google is used as a second discovery engine. The caller still receives only
-    text from pages that were actually opened.
+    One unavailable site must not block a Telegram request for minutes.
     """
     result = await _browser_search_pages_engine(query, max_pages, engine)
-    if len(result) < max(2, max_pages // 2):
+    if len(result) < max(1, max_pages // 2):
         fallback_engine = "google" if engine == "yandex" else "yandex"
         try:
-            extra = await _browser_search_pages_engine(query, max_pages, fallback_engine)
+            extra = await asyncio.wait_for(
+                _browser_search_pages_engine(query, max_pages, fallback_engine),
+                timeout=SEARCH_TIMEOUT_MS / 1000 * 2,
+            )
         except Exception:
             extra = []
         seen = {url for url, _ in result}
