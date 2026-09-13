@@ -101,7 +101,7 @@ def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _format_event_list(events, mode: str) -> list[str]:
+def _format_event_list(events) -> list[str]:
     now = datetime.now()
     grouped: dict[str, list] = {"today": [], "tomorrow": [], "day_after": []}
     for event in events[:15]:
@@ -125,6 +125,29 @@ def _format_event_list(events, mode: str) -> list[str]:
             lines.append(f"• {escape(event.name[:180])} — {time_text}{live}")
         lines.append("")
     return lines
+
+
+def _empty_message(title: str, mode: str, errors: list[str]) -> str:
+    if mode == "live":
+        return (
+            f"<b>{escape(title)} — LIVE</b>\n\n"
+            "🔴 Сейчас активных матчей не найдено.\n\n"
+            "Возможно, сегодняшние матчи уже завершились или прямо сейчас нет матчей в LIVE."
+        )
+
+    # Не показываем пользователю внутренние ошибки парсера/браузера.
+    if errors and any("ConnectTimeout" in error or "Browser" in error for error in errors):
+        return (
+            f"<b>{escape(title)} — PREMATCH</b>\n\n"
+            "⚠️ Сейчас не удалось получить актуальный список матчей с источников.\n"
+            "Нажмите «Обновить список» и попробуйте ещё раз."
+        )
+
+    return (
+        f"<b>{escape(title)} — PREMATCH</b>\n\n"
+        "📅 На сегодня новых матчей больше нет.\n"
+        "Все сегодняшние матчи уже начались или завершились."
+    )
 
 
 @dp.message(CommandStart())
@@ -173,13 +196,8 @@ async def collect_sport(callback: CallbackQuery) -> None:
 
     result = await collect(sport, mode)
     if not result.events:
-        error_text = ""
-        if result.errors:
-            error_text = "\n\nТехнические ошибки:\n" + "\n".join(escape(x) for x in result.errors[:3])
         await callback.message.edit_text(
-            f"<b>{escape(title)}</b>\n\n"
-            f"Подтверждённых матчей на реальных страницах источников не найдено.\n"
-            f"Источник: Browser Web Research{error_text}",
+            _empty_message(title, mode, result.errors),
             reply_markup=sport_menu(sport),
         )
         return
@@ -193,7 +211,7 @@ async def collect_sport(callback: CallbackQuery) -> None:
         "",
         "Подтверждённые матчи из источников:",
     ]
-    lines.extend(_format_event_list(events, mode))
+    lines.extend(_format_event_list(events))
     lines.append("Нажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
     await callback.message.edit_text(
         "\n".join(lines),
@@ -212,8 +230,7 @@ async def select_event(callback: CallbackQuery) -> None:
     result = await collect(sport, mode)
     if not result.events:
         await callback.message.edit_text(
-            f"<b>{escape(title)}</b>\n\nМатч больше не найден в источниках.\n\n"
-            "Это означает, что бот не будет придумывать данные или коэффициенты.",
+            _empty_message(title, mode, result.errors),
             reply_markup=sport_menu(sport),
         )
         return
