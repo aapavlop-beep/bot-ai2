@@ -7,8 +7,8 @@ from urllib.parse import quote_plus, urlparse
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
-SEARCH_TIMEOUT_MS = 8_000
-PAGE_TIMEOUT_MS = 8_000
+SEARCH_TIMEOUT_MS = 12_000
+PAGE_TIMEOUT_MS = 20_000
 
 
 @dataclass(slots=True)
@@ -50,12 +50,16 @@ class BrowserResearch:
         await self.start()
         assert self.context is not None
         page = await self.context.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # Sports pages may keep analytics/advertising requests open for a long
+        # time. We only need the rendered document, so commit is more reliable
+        # than waiting for DOMContentLoaded.
+        await page.goto(url, wait_until="commit", timeout=timeout_ms)
         return page
 
     async def text(self, url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> str:
         page = await self.open(url, timeout_ms)
         try:
+            await page.wait_for_timeout(1_000)
             return await page.locator("body").inner_text(timeout=timeout_ms)
         finally:
             await page.close()
@@ -83,8 +87,10 @@ async def browser_source_text(url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> st
     async with lock:
         page = await research.open(url, timeout_ms)
         try:
-            await page.wait_for_timeout(500)
-            return await page.locator("body").inner_text(timeout=timeout_ms)
+            await page.wait_for_timeout(1_000)
+            body = page.locator("body")
+            await body.wait_for(state="visible", timeout=timeout_ms)
+            return await body.inner_text(timeout=timeout_ms)
         finally:
             await page.close()
 
@@ -105,8 +111,8 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
     async with lock:
         page = await research.context.new_page()
         try:
-            await page.goto(urls[engine] + quote_plus(query), wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
-            await page.wait_for_timeout(400)
+            await page.goto(urls[engine] + quote_plus(query), wait_until="commit", timeout=SEARCH_TIMEOUT_MS)
+            await page.wait_for_timeout(800)
             links = await page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
             )
@@ -131,8 +137,8 @@ async def _browser_search_pages_engine(query: str, max_pages: int, engine: str) 
     async with lock:
         search_page = await research.context.new_page()
         try:
-            await search_page.goto(urls[engine] + quote_plus(query), wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
-            await search_page.wait_for_timeout(400)
+            await search_page.goto(urls[engine] + quote_plus(query), wait_until="commit", timeout=SEARCH_TIMEOUT_MS)
+            await search_page.wait_for_timeout(800)
             links = await search_page.locator("a").evaluate_all(
                 "els => els.map(a => ({title:(a.innerText||a.textContent||'').trim(), href:a.href}))"
             )
@@ -161,8 +167,8 @@ async def _browser_search_pages_engine(query: str, max_pages: int, engine: str) 
                 if len(result) >= max_pages:
                     break
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                    await page.wait_for_timeout(350)
+                    await page.goto(url, wait_until="commit", timeout=PAGE_TIMEOUT_MS)
+                    await page.wait_for_timeout(700)
                     text = await page.locator("body").inner_text(timeout=PAGE_TIMEOUT_MS)
                     if text and len(text.strip()) >= 200:
                         result.append((url, text))
@@ -176,9 +182,7 @@ async def _browser_search_pages_engine(query: str, max_pages: int, engine: str) 
 
 async def browser_search_pages(query: str, max_pages: int = 3, engine: str = "yandex") -> list[tuple[str, str]]:
     """Discover and open real pages with bounded time and a reusable browser."""
-    # Search itself can take 8s; each candidate page can take up to 8s.
-    # Leave enough budget for the requested number of real pages.
-    timeout = max(30, 12 + 10 * max_pages)
+    timeout = max(45, 20 + 12 * max_pages)
     try:
         return await asyncio.wait_for(
             _browser_search_pages_engine(query, max_pages, engine),
