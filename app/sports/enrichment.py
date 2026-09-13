@@ -5,12 +5,13 @@ from urllib.parse import urlparse
 
 from .models import Event
 from .odds import collect_bookmaker_odds
-from ..browser.research import browser_search_pages
+from ..browser.research import browser_search_pages, browser_source_text
 
 
 MAX_PAGE_CHARS = 14_000
-MAX_RESEARCH_PAGES_PER_QUERY = 3
-RESEARCH_CONCURRENCY = 4
+MAX_RESEARCH_PAGES_PER_QUERY = 2
+RESEARCH_CONCURRENCY = 6
+RESEARCH_TIMEOUT = 14
 ALLOWED_RESEARCH_DOMAINS = {
     "sports.ru",
     "championat.com",
@@ -20,6 +21,15 @@ ALLOWED_RESEARCH_DOMAINS = {
     "khl.ru",
     "hltv.org",
     "liquipedia.net",
+}
+
+DIRECT_RESEARCH_URLS = {
+    "khl": (
+        "https://www.sports.ru/hockey/tournament/khl/calendar/",
+        "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
+    ),
+    "cs2": ("https://www.hltv.org/matches",),
+    "dota2": ("https://liquipedia.net/dota2/Matches",),
 }
 
 
@@ -34,11 +44,11 @@ def _queries(event: Event) -> list[tuple[str, str]]:
     name = f'"{event.name}"'
     if event.sport == "khl":
         return [
-            ("match", f"{name} {date_text} матч КХЛ составы стартовые пятерки {mode}"),
-            ("form", f"{name} последние 5 матчей результаты форма {mode}"),
+            ("match", f"{name} {date_text} матч КХЛ составы {mode}"),
+            ("form", f"{name} последние 5 матчей результаты форма"),
             ("h2h", f"{name} очные встречи H2H последние матчи"),
-            ("table", f"{name} КХЛ турнирная таблица положение конференция"),
-            ("lineups", f"{name} состав травмы потери дисквалификации новости"),
+            ("table", f"{name} КХЛ турнирная таблица положение"),
+            ("lineups", f"{name} состав травмы потери дисквалификации"),
             ("stats", f"{name} статистика шайбы голы вратари большинство меньшинство"),
         ]
     if event.sport == "cs2":
@@ -53,9 +63,19 @@ def _queries(event: Event) -> list[tuple[str, str]]:
         ("match", f"{name} {date_text} Dota 2 матч составы {mode}"),
         ("form", f"{name} последние матчи результаты форма рейтинг"),
         ("h2h", f"{name} H2H очные встречи"),
-        ("stats", f"{name} статистика карты игроки draft"),
+        ("stats", f"{name} статистика игроки draft"),
         ("lineups", f"{name} состав замены новости"),
     ]
+
+
+async def _direct_source(url: str) -> tuple[str, str, str | None]:
+    try:
+        text = await asyncio.wait_for(browser_source_text(url, timeout_ms=12_000), timeout=13)
+        if text and len(text.strip()) >= 200:
+            return url, text, None
+        return url, "", "direct source returned too little text"
+    except Exception as exc:
+        return url, "", f"{url}: {type(exc).__name__}: {exc}"
 
 
 async def _collect_category(
@@ -67,7 +87,7 @@ async def _collect_category(
         try:
             pages = await asyncio.wait_for(
                 browser_search_pages(query, max_pages=MAX_RESEARCH_PAGES_PER_QUERY),
-                timeout=25,
+                timeout=RESEARCH_TIMEOUT,
             )
             return category, pages, []
         except Exception as exc:
@@ -75,20 +95,29 @@ async def _collect_category(
 
 
 async def enrich_event(event: Event) -> Event:
-    """Collect sports evidence and verified Russian bookmaker lines.
-
-    Research categories run concurrently and each category has a hard timeout.
-    A slow/unavailable source is isolated instead of blocking the whole match.
-    """
+    """Collect direct source pages first, then optional search evidence and bookmaker lines."""
     evidence: dict[str, str] = {}
     source_urls: list[str] = []
     errors: list[str] = []
 
+    direct_urls = list(DIRECT_RESEARCH_URLS.get(event.sport, ()))
+    if event.url and event.url not in direct_urls:
+        direct_urls.insert(0, event.url)
+
+    direct_results = await asyncio.gather(*(_direct_source(url) for url in direct_urls))
+    for url, text, error in direct_results:
+        if error:
+            errors.append(error)
+            continue
+        if not _valid_research_url(url):
+            continue
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        key = f"direct:{domain}:{urlparse(url).path}"
+        evidence[key] = text.strip()[:MAX_PAGE_CHARS]
+        source_urls.append(url)
+
     semaphore = asyncio.Semaphore(RESEARCH_CONCURRENCY)
-    tasks = [
-        _collect_category(category, query, semaphore)
-        for category, query in _queries(event)
-    ]
+    tasks = [_collect_category(category, query, semaphore) for category, query in _queries(event)]
     results = await asyncio.gather(*tasks)
 
     for category, pages, category_errors in results:
@@ -106,10 +135,10 @@ async def enrich_event(event: Event) -> Event:
     try:
         bookmaker_odds, odds_errors = await asyncio.wait_for(
             collect_bookmaker_odds(event),
-            timeout=45,
+            timeout=30,
         )
     except asyncio.TimeoutError:
-        bookmaker_odds, odds_errors = {}, ["bookmakers: timeout after 45 seconds"]
+        bookmaker_odds, odds_errors = {}, ["bookmakers: timeout after 30 seconds"]
     except Exception as exc:
         bookmaker_odds, odds_errors = {}, [f"bookmakers: {type(exc).__name__}: {exc}"]
     errors.extend(odds_errors)
