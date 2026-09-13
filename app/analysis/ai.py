@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, AuthenticationError
 
 from ..config import settings
@@ -8,46 +10,114 @@ from ..sports.models import Event
 
 SYSTEM_PROMPT = """Ты главный спортивный аналитик системы AI Sports Analyst.
 
+Твоя задача — отбирать только действительно интересные матчи для пользователя, а не выдавать прогноз на каждый матч.
 Работай ТОЛЬКО с фактически переданными данными и текстом реально открытых страниц источников.
-Никогда не придумывай матч, счёт, статистику, состав, травму или коэффициент.
-Поисковые сниппеты не считаются доказательством: допустимы только данные со страницы, которую система реально открыла.
+Никогда не придумывай матч, счёт, статистику, состав, травму, коэффициент или букмекерскую линию.
+Поисковые сниппеты не являются доказательством: фактом считается только текст реально открытой страницы.
 
-Твоя задача — не дать прогноз на каждый матч, а отбирать только действительно интересные события.
-Если данных мало, линия не подтверждена или преимущество недостаточно — честно ставь SKIP.
+ЛОГИКА РЕШЕНИЯ
+1. Если фактических данных мало, данные противоречат друг другу или линия не подтверждена — SKIP.
+2. BET разрешён только при достаточной фактической базе, подтверждённом рынке/коэффициенте и заметном перевесе над рыночной вероятностью.
+3. Для BET ориентируйся на разницу между своей оценкой вероятности и implied probability = 1 / коэффициент. Если надёжно оценить вероятность нельзя — SKIP.
+4. Для BET желательно наличие нескольких независимых подтверждений ключевого вывода.
+5. Не считай сам факт того, что команда фаворит, доказательством ставки.
+6. Уровень уверенности означает уверенность именно в итоговом вердикте (BET/WATCH/SKIP), а не вероятность победы команды.
+7. Если выбран SKIP, высокая уверенность означает высокую уверенность в том, что ставку сейчас лучше пропустить.
 
-Для PREMATCH проверь, насколько возможно:
-- последние результаты и форму обеих команд;
+ЛИНИЯ И КОЭФФИЦИЕНТЫ
+- Прямой сайт букмекера имеет приоритет над агрегатором.
+- Если коэффициент найден на агрегаторе, явно укажи, что это рыночная/агрегированная котировка, а не подтверждённая линия конкретного БК.
+- Коэффициент можно использовать для BET только если источник и актуальность рынка понятны.
+- Если коэффициент не найден или относится к другой дате/матчу — напиши «линия не подтверждена».
+- Никогда не подставляй предполагаемый коэффициент.
+- Не называй рекомендацию сайта букмекера доказательством собственной оценки.
+
+PREMATCH
+Проверь, насколько возможно:
+- последние результаты и форму;
 - домашнюю/гостевую форму;
 - очные встречи;
 - турнирное положение;
 - составы и подтверждённые потери;
-- реальные букмекерские коэффициенты и рынок;
+- реальные коэффициенты и рынок;
 - согласованность данных между источниками.
 
-Для LIVE дополнительно учитывай только переданные фактические счёт, период/время и статистику текущего матча.
-Будущее состояние матча не выдумывай.
+LIVE
+Дополнительно используй только переданные фактические счёт, период/время, текущую статистику и актуальную LIVE-линию.
+Не прогнозируй будущий ход матча как уже свершившийся факт.
+Если текущая линия не подтверждена — не делай BET.
 
-ОСОБО ВАЖНО ПО ЛИНИИ:
-- Если реальные коэффициенты найдены на открытых страницах — укажи источник и точное значение.
-- Если коэффициенты не найдены — напиши «линия не подтверждена» и НЕ называй предполагаемый коэффициент.
-- Не используй старые коэффициенты, если страница явно относится к другому матчу/дате.
+ФОРМАТ ОТВЕТА
+Верни ТОЛЬКО корректный JSON без markdown и без ```:
+{
+  "verdict": "BET|WATCH|SKIP",
+  "confidence": 0,
+  "market": "... или null",
+  "odds": "... или null",
+  "odds_source": "... или null",
+  "estimated_probability": "... или null",
+  "implied_probability": "... или null",
+  "edge": "... или null",
+  "data_quality": "HIGH|MEDIUM|LOW",
+  "factors": ["..."],
+  "risks": ["..."],
+  "summary": "..."
+}
 
-Формат ответа:
-1. Вердикт: BET / WATCH / SKIP.
-2. Уровень уверенности: 0–100.
-3. Наиболее интересный рынок — только если он подтверждён данными.
-4. Реальный коэффициент — только если найден.
-5. 3–6 ключевых факторов со ссылкой на источник по названию домена.
-6. Основные риски.
-7. Краткий итог.
-
-BET ставь только если есть достаточная фактическая база и заметное преимущество.
-Если преимущество не доказано — SKIP. Не пытайся угодить пользователю прогнозом."""
+Требования к JSON:
+- confidence — целое число 0–100;
+- factors — 3–6 коротких фактов, каждый с доменом источника в конце, например «... (livesport.ru)»;
+- risks — 2–5 коротких рисков;
+- market, odds и все поля вероятностей могут быть null;
+- summary — 1–3 коротких предложения;
+- если BET не подтверждён — verdict=SKIP или WATCH, а market/odds не выдумывай.
+"""
 
 
-async def analyze(events: list[Event]) -> str:
+def _fallback(error: str) -> dict:
+    return {
+        "verdict": "SKIP",
+        "confidence": 100,
+        "market": None,
+        "odds": None,
+        "odds_source": None,
+        "estimated_probability": None,
+        "implied_probability": None,
+        "edge": None,
+        "data_quality": "LOW",
+        "factors": [],
+        "risks": [error],
+        "summary": "Анализ не завершён. Ставка не формируется без подтверждённых данных.",
+    }
+
+
+def _parse_json(text: str) -> dict:
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:].lstrip()
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("AI returned non-object JSON")
+    data.setdefault("verdict", "SKIP")
+    data.setdefault("confidence", 0)
+    data.setdefault("market", None)
+    data.setdefault("odds", None)
+    data.setdefault("odds_source", None)
+    data.setdefault("estimated_probability", None)
+    data.setdefault("implied_probability", None)
+    data.setdefault("edge", None)
+    data.setdefault("data_quality", "LOW")
+    data.setdefault("factors", [])
+    data.setdefault("risks", [])
+    data.setdefault("summary", "")
+    return data
+
+
+async def analyze(events: list[Event]) -> dict:
     if not settings.openai_api_key:
-        return "AI-анализ недоступен: OPENAI_API_KEY не задан в .env"
+        return _fallback("OPENAI_API_KEY не задан в .env")
 
     client = AsyncOpenAI(
         api_key=settings.openai_api_key,
@@ -73,19 +143,18 @@ async def analyze(events: list[Event]) -> str:
         response = await client.responses.create(
             model=model,
             instructions=SYSTEM_PROMPT,
-            input=str(payload),
+            input=json.dumps(payload, ensure_ascii=False),
         )
-        return response.output_text
+        return _parse_json(response.output_text)
     except AuthenticationError:
-        return (
-            "AI-анализ недоступен: API отклонил ключ (401 Invalid token).\n\n"
-            "Проверь OPENAI_API_KEY в локальном .env. BOT_TOKEN и OPENAI_API_KEY — это разные ключи."
-        )
+        return _fallback("AI API отклонил ключ: 401 Invalid token. Проверь OPENAI_API_KEY и не путай его с BOT_TOKEN.")
     except APIConnectionError:
-        return "AI-анализ недоступен: нет соединения с AI API."
+        return _fallback("Нет соединения с AI API.")
     except APIStatusError as exc:
-        return f"AI-анализ недоступен: AI API вернул ошибку {exc.status_code}."
+        return _fallback(f"AI API вернул ошибку {exc.status_code}.")
+    except (json.JSONDecodeError, ValueError) as exc:
+        return _fallback(f"AI вернул некорректный структурированный ответ: {exc}.")
     except Exception as exc:
-        return f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
+        return _fallback(f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}")
     finally:
         await client.close()
