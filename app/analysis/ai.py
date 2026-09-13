@@ -22,7 +22,7 @@ async def analyze(events: list[Event]) -> str:
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url or "https://api.openai.com/v1",
     )
-    model = settings.openai_model or "gpt-5.6"
+    model = settings.openai_model or "gpt-6-astra"
     payload = [
         {
             "sport": event.sport,
@@ -46,13 +46,13 @@ async def analyze(events: list[Event]) -> str:
         return response.output_text
     except AuthenticationError:
         return (
-            "AI-анализ недоступен: OpenAI отклонил API-ключ (401 Invalid token).\n\n"
-            "Проверь OPENAI_API_KEY в .env. Не отправляй ключ в Telegram или GitHub."
+            "AI-анализ недоступен: API отклонил ключ (401 Invalid token).\n\n"
+            "Проверь OPENAI_API_KEY в локальном .env. BOT_TOKEN и OPENAI_API_KEY — это разные ключи."
         )
     except APIConnectionError:
-        return "AI-анализ недоступен: нет соединения с OpenAI API."
+        return "AI-анализ недоступен: нет соединения с AI API."
     except APIStatusError as exc:
-        return f"AI-анализ недоступен: OpenAI API вернул ошибку {exc.status_code}."
+        return f"AI-анализ недоступен: AI API вернул ошибку {exc.status_code}."
     except Exception as exc:
         return f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
     finally:
