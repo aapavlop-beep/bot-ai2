@@ -169,7 +169,7 @@ def _empty_message(title: str, mode: str, errors: list[str]) -> str:
         return (
             f"<b>{escape(title)} — LIVE</b>\n\n"
             "🔴 <b>Сейчас активных матчей не найдено.</b>\n\n"
-            "Возможно, матчи уже завершились или прямо сейчас нет игр в LIVE."
+            "Бот показывает LIVE только когда источник явно подтверждает, что матч идёт."
         )
 
     if errors and any("ConnectTimeout" in error or "Browser" in error for error in errors):
@@ -182,7 +182,7 @@ def _empty_message(title: str, mode: str, errors: list[str]) -> str:
     return (
         f"<b>{escape(title)} — PREMATCH</b>\n\n"
         "✅ <b>На сегодня новых матчей не осталось.</b>\n\n"
-        "Все сегодняшние матчи уже начались или завершились."
+        "Все сегодняшние матчи уже начались или завершились. Если есть игры на следующие дни, они будут показаны ниже отдельными блоками."
     )
 
 
@@ -220,7 +220,7 @@ def _analysis_text(analysis: dict) -> str:
         if odds:
             odds_line = f"💰 Коэффициент: <b>{escape(str(odds))}</b>"
             if odds_source:
-                odds_line += f"\n   Источник: {escape(str(odds_source))}"
+                odds_line += f"\n   БК: {escape(str(odds_source))}"
             lines.append(odds_line)
         else:
             lines.append("⚠️ Линия не подтверждена — коэффициент не используем.")
@@ -324,7 +324,7 @@ async def select_event(callback: CallbackQuery) -> None:
     _, sport, mode, index_text = callback.data.split(":", 3)
     title = next(item.title for item in SPORTS if item.key == sport)
 
-    await callback.answer("Собираю статистику, форму и линию с реальных страниц…")
+    await callback.answer("Собираю статистику, форму и линию российских БК…")
     await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Собираю фактические данные по матчу через браузер…")
 
     result = await collect(sport, mode)
@@ -358,14 +358,22 @@ async def select_event(callback: CallbackQuery) -> None:
     status_text = event.status or "PREMATCH"
     score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
     pages = event.metadata.get("research_page_count", "0")
+    bookmakers = event.metadata.get("bookmaker_names", "")
+    bookmaker_count = event.metadata.get("bookmaker_count", "0")
 
     analysis = await analyze([event])
     analysis_block = _analysis_text(analysis)
+    line_block = (
+        f"📈 <b>Российские БК:</b> {escape(bookmakers)} ({escape(bookmaker_count)} подтверждено)"
+        if bookmakers
+        else "📈 <b>Российская линия:</b> не найдена или не подтверждена"
+    )
 
     text = (
         f"<b>{escape(event.name)}</b>\n"
         f"🗓 {time_text}\n"
         f"📌 {escape(status_text)}{score_text}\n"
+        f"{line_block}\n"
         f"🌐 Открыто страниц исследования: <b>{escape(pages)}</b>\n\n"
         f"{analysis_block}"
     )
