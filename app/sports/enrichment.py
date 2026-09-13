@@ -17,7 +17,6 @@ ALLOWED_RESEARCH_DOMAINS = {
     "khl.ru",
     "hltv.org",
     "liquipedia.net",
-    "liquipedia.net",
 }
 
 
@@ -29,20 +28,35 @@ def _valid_research_url(url: str) -> bool:
 def _queries(event: Event) -> list[tuple[str, str]]:
     date_text = event.start_time.strftime("%d.%m.%Y") if event.start_time else ""
     mode = event.mode.upper()
+    name = f'"{event.name}"'
+    if event.sport == "khl":
+        return [
+            ("match", f"{name} {date_text} матч КХЛ составы стартовые пятерки {mode}"),
+            ("form", f"{name} последние 5 матчей результаты форма {mode}"),
+            ("h2h", f"{name} очные встречи H2H последние матчи"),
+            ("table", f"{name} КХЛ турнирная таблица положение конференция"),
+            ("lineups", f"{name} состав травмы потери дисквалификации новости"),
+            ("stats", f"{name} статистика шайбы голы вратари большинство меньшинство"),
+        ]
+    if event.sport == "cs2":
+        return [
+            ("match", f"{name} {date_text} CS2 матч составы {mode}"),
+            ("form", f"{name} последние матчи результаты форма рейтинг"),
+            ("h2h", f"{name} H2H очные встречи"),
+            ("stats", f"{name} статистика карты игроки рейтинг"),
+            ("lineups", f"{name} состав замены stand-in новости"),
+        ]
     return [
-        (
-            "match",
-            f'"{event.name}" {date_text} статистика последние матчи состав травмы {mode}',
-        ),
-        (
-            "form",
-            f'"{event.name}" {date_text} результаты H2H форма таблица',
-        ),
+        ("match", f"{name} {date_text} Dota 2 матч составы {mode}"),
+        ("form", f"{name} последние матчи результаты форма рейтинг"),
+        ("h2h", f"{name} H2H очные встречи"),
+        ("stats", f"{name} статистика карты игроки draft"),
+        ("lineups", f"{name} состав замены новости"),
     ]
 
 
 async def enrich_event(event: Event) -> Event:
-    """Collect only opened, validated sports pages plus official RU bookmaker lines."""
+    """Collect broad opened-page sports evidence plus verified Russian bookmaker lines."""
     evidence: dict[str, str] = {}
     source_urls: list[str] = []
     errors: list[str] = []
@@ -58,7 +72,10 @@ async def enrich_event(event: Event) -> Event:
             if not _valid_research_url(url) or not text.strip():
                 continue
             domain = urlparse(url).netloc.lower().removeprefix("www.")
-            key = f"{category}:{domain}"
+            # Keep more than one page per domain when it covers a different
+            # evidence category. This prevents one generic article from
+            # replacing form/H2H/lineup/statistics evidence.
+            key = f"{category}:{domain}:{urlparse(url).path}"
             if key in evidence:
                 continue
             evidence[key] = text.strip()[:MAX_PAGE_CHARS]
@@ -70,11 +87,10 @@ async def enrich_event(event: Event) -> Event:
     metadata = dict(event.metadata)
     metadata["research_collected"] = "true"
     metadata["research_page_count"] = str(len(evidence))
+    metadata["research_source_count"] = str(len({urlparse(u).netloc.lower().removeprefix('www.') for u in source_urls}))
     if source_urls:
-        metadata["research_urls"] = "\n".join(source_urls[:20])
+        metadata["research_urls"] = "\n".join(source_urls[:30])
 
-    # The AI receives bookmaker evidence separately so it cannot confuse a
-    # general sports article with an actual betting line.
     metadata["bookmaker_count"] = str(len(bookmaker_odds))
     metadata["bookmaker_names"] = ", ".join(bookmaker_odds.keys())
     for bookmaker, text in bookmaker_odds.items():
@@ -82,7 +98,7 @@ async def enrich_event(event: Event) -> Event:
         metadata[f"bookmaker_{safe_key}"] = text
 
     if errors:
-        metadata["research_errors"] = "\n".join(errors[:20])
+        metadata["research_errors"] = "\n".join(errors[:30])
 
     for index, (key, text) in enumerate(evidence.items(), start=1):
         metadata[f"research_{index}_{key}"] = text
