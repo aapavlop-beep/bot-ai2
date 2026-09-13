@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from html import escape
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -16,6 +17,7 @@ from .sports.enrichment import enrich_event
 
 
 dp = Dispatcher()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -45,7 +47,7 @@ def sport_menu(sport: str) -> InlineKeyboardMarkup:
 def _now_for_event(event) -> datetime:
     if event.start_time and event.start_time.tzinfo:
         return datetime.now(event.start_time.tzinfo)
-    return datetime.now()
+    return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
 
 
 def _event_visible(event, mode: str) -> bool:
@@ -71,7 +73,7 @@ def _day_group(event, now: datetime) -> str:
 
 def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
     rows = []
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
     grouped = {"today": [], "tomorrow": [], "day_after": []}
 
     for index, event in enumerate(events):
@@ -135,7 +137,7 @@ def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup
 
 
 def _format_event_list(events, mode: str) -> list[str]:
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
     grouped: dict[str, list] = {"today": [], "tomorrow": [], "day_after": []}
     for event in events:
         if not _event_visible(event, mode):
