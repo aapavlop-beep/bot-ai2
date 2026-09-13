@@ -1,3 +1,5 @@
+from html import escape
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -91,7 +93,7 @@ async def select_sport(callback: CallbackQuery) -> None:
     sport = callback.data.split(":", 1)[1]
     title = next(item.title for item in SPORTS if item.key == sport)
     await callback.message.edit_text(
-        f"<b>{title}</b>\n\nВыберите режим анализа:",
+        f"<b>{escape(title)}</b>\n\nВыберите режим анализа:",
         reply_markup=sport_menu(sport),
     )
     await callback.answer()
@@ -102,26 +104,26 @@ async def collect_sport(callback: CallbackQuery) -> None:
     _, sport, mode = callback.data.split(":", 2)
     title = next(item.title for item in SPORTS if item.key == sport)
     await callback.answer("Читаю страницы источников через браузер…")
-    await callback.message.edit_text(f"<b>{title}</b>\n\n🔎 Browser Web Research…")
+    await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Browser Web Research…")
 
     result = await collect(sport, mode)
     if not result.events:
         error_text = ""
         if result.errors:
-            error_text = "\n\nТехнические ошибки:\n" + "\n".join(result.errors[:3])
+            error_text = "\n\nТехнические ошибки:\n" + "\n".join(escape(x) for x in result.errors[:3])
         await callback.message.edit_text(
-            f"<b>{title}</b>\n\n"
+            f"<b>{escape(title)}</b>\n\n"
             f"Подтверждённых матчей на реальных страницах источников не найдено.\n"
             f"Источник: Browser Web Research{error_text}",
             reply_markup=sport_menu(sport),
         )
         return
 
-    lines = [f"<b>{title} — {mode.upper()}</b>", "", "Подтверждённые матчи из источников:"]
+    lines = [f"<b>{escape(title)} — {escape(mode.upper())}</b>", "", "Подтверждённые матчи из источников:"]
     for event in result.events[:15]:
         time_text = event.start_time.strftime("%d.%m %H:%M") if event.start_time else "время н/д"
         live = " 🔴 LIVE" if event.status == "LIVE" else ""
-        lines.append(f"• {event.name[:180]} — {time_text}{live}")
+        lines.append(f"• {escape(event.name[:180])} — {time_text}{live}")
     lines.append("\nНажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
     await callback.message.edit_text(
         "\n".join(lines),
@@ -135,12 +137,12 @@ async def select_event(callback: CallbackQuery) -> None:
     title = next(item.title for item in SPORTS if item.key == sport)
 
     await callback.answer("Проверяю матч и переданные данные…")
-    await callback.message.edit_text(f"<b>{title}</b>\n\n🔎 Обновляю данные матча через браузер…")
+    await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Обновляю данные матча через браузер…")
 
     result = await collect(sport, mode)
     if not result.events:
         await callback.message.edit_text(
-            f"<b>{title}</b>\n\nМатч больше не найден в источниках.\n\n"
+            f"<b>{escape(title)}</b>\n\nМатч больше не найден в источниках.\n\n"
             "Это означает, что бот не будет придумывать данные или коэффициенты.",
             reply_markup=sport_menu(sport),
         )
@@ -156,7 +158,7 @@ async def select_event(callback: CallbackQuery) -> None:
 
     if index >= len(result.events):
         await callback.message.edit_text(
-            f"<b>{title}</b>\n\nСписок матчей изменился. Нажмите «К матчам» и выберите матч заново.",
+            f"<b>{escape(title)}</b>\n\nСписок матчей изменился. Нажмите «К матчам» и выберите матч заново.",
             reply_markup=sport_menu(sport),
         )
         return
@@ -164,7 +166,7 @@ async def select_event(callback: CallbackQuery) -> None:
     event = result.events[index]
     time_text = event.start_time.strftime("%d.%m.%Y %H:%M") if event.start_time else "время н/д"
     status_text = event.status or "PREMATCH"
-    score_text = f"\n🏒 Счёт: {event.score}" if event.score else ""
+    score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
 
     try:
         analysis = await analyze([event])
@@ -172,10 +174,10 @@ async def select_event(callback: CallbackQuery) -> None:
         analysis = f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
 
     text = (
-        f"<b>{event.name}</b>\n"
+        f"<b>{escape(event.name)}</b>\n"
         f"🗓 {time_text}\n"
-        f"📌 {status_text}{score_text}\n\n"
-        f"<b>AI-анализ:</b>\n{analysis[:3500]}"
+        f"📌 {escape(status_text)}{score_text}\n\n"
+        f"<b>AI-анализ:</b>\n{escape(analysis[:3500])}"
     )
     await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event))
 
@@ -189,7 +191,7 @@ async def select_mode(callback: CallbackQuery) -> None:
     ]
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="home")])
     await callback.message.edit_text(
-        f"<b>{mode.upper()}</b>\n\nВыберите вид спорта:",
+        f"<b>{escape(mode.upper())}</b>\n\nВыберите вид спорта:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
