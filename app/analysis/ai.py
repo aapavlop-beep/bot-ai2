@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, AuthenticationError
 
 from ..config import settings
 from ..sports.models import Event
@@ -9,16 +9,18 @@ from ..sports.models import Event
 SYSTEM_PROMPT = """Ты спортивный аналитик. Работай только с переданными проверенными данными.
 Не придумывай матчи, счёт, статистику или коэффициенты. Если данных недостаточно,
 прямо укажи это. Отбирай только события с достаточным количеством подтверждений.
-Для LIVE учитывай только фактически переданный текущий статус матча."""
+Для LIVE учитывай только фактически переданный текущий статус матча.
+Давай практичный анализ: ключевые факторы, риски, наиболее интересные варианты.
+Не выдумывай букмекерские коэффициенты. Если реальной линии нет в данных — так и скажи."""
 
 
 async def analyze(events: list[Event]) -> str:
     if not settings.openai_api_key:
-        return "AI_ANALYSIS_DISABLED: OPENAI_API_KEY не задан"
+        return "AI-анализ недоступен: OPENAI_API_KEY не задан в .env"
 
     client = AsyncOpenAI(
         api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url or None,
+        base_url=settings.openai_base_url or "https://api.openai.com/v1",
     )
     model = settings.openai_model or "gpt-5.6"
     payload = [
@@ -34,9 +36,24 @@ async def analyze(events: list[Event]) -> str:
         }
         for event in events
     ]
-    response = await client.responses.create(
-        model=model,
-        instructions=SYSTEM_PROMPT,
-        input=str(payload),
-    )
-    return response.output_text
+
+    try:
+        response = await client.responses.create(
+            model=model,
+            instructions=SYSTEM_PROMPT,
+            input=str(payload),
+        )
+        return response.output_text
+    except AuthenticationError:
+        return (
+            "AI-анализ недоступен: OpenAI отклонил API-ключ (401 Invalid token).\n\n"
+            "Проверь OPENAI_API_KEY в .env. Не отправляй ключ в Telegram или GitHub."
+        )
+    except APIConnectionError:
+        return "AI-анализ недоступен: нет соединения с OpenAI API."
+    except APIStatusError as exc:
+        return f"AI-анализ недоступен: OpenAI API вернул ошибку {exc.status_code}."
+    except Exception as exc:
+        return f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
+    finally:
+        await client.close()
