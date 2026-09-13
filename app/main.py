@@ -198,6 +198,7 @@ def _analysis_text(analysis: dict) -> str:
     quality = str(analysis.get("data_quality") or "LOW").upper()
     factors = analysis.get("factors") or []
     risks = analysis.get("risks") or []
+    data_gaps = analysis.get("data_gaps") or []
     summary = str(analysis.get("summary") or "").strip()
 
     verdict_view = {
@@ -241,6 +242,10 @@ def _analysis_text(analysis: dict) -> str:
     if risks:
         lines += ["", "<b>⚠️ Риски</b>"]
         lines.extend(f"• {escape(str(item))}" for item in risks[:5])
+
+    if data_gaps:
+        lines += ["", "<b>📋 Чего не хватило</b>"]
+        lines.extend(f"• {escape(str(item))}" for item in data_gaps[:6])
 
     if summary:
         lines += ["", "<b>📌 Итог</b>", escape(summary)]
@@ -358,6 +363,7 @@ async def select_event(callback: CallbackQuery) -> None:
     status_text = event.status or "PREMATCH"
     score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
     pages = event.metadata.get("research_page_count", "0")
+    sources = event.metadata.get("research_source_count", "0")
     bookmakers = event.metadata.get("bookmaker_names", "")
     bookmaker_count = event.metadata.get("bookmaker_count", "0")
 
@@ -374,7 +380,7 @@ async def select_event(callback: CallbackQuery) -> None:
         f"🗓 {time_text}\n"
         f"📌 {escape(status_text)}{score_text}\n"
         f"{line_block}\n"
-        f"🌐 Открыто страниц исследования: <b>{escape(pages)}</b>\n\n"
+        f"🌐 Источников: <b>{escape(sources)}</b> • страниц: <b>{escape(pages)}</b>\n\n"
         f"{analysis_block}"
     )
     await callback.message.edit_text(text[:4000], reply_markup=event_menu(sport, mode, event, index))
