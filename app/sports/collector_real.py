@@ -34,8 +34,6 @@ def _allowed_for_mode(start_time: datetime, mode: str, now: datetime, explicit_l
     if mode == "prematch":
         return start_time > now
 
-    # LIVE is never inferred merely from the scheduled start time. A source
-    # must explicitly show an in-progress marker and, ideally, a score.
     if mode == "live":
         return explicit_live and start_time.date() == today
 
@@ -73,7 +71,6 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
                 break
             if nxt in {"Дата и время", "Хозяева", "Счет", "Гости"} or nxt in separators:
                 continue
-            # Do not mistake status/score labels for team names.
             if nxt.lower() in {"завершен", "предстоящие", "live", "онлайн", "матч завершен"}:
                 continue
             candidates.append(nxt)
@@ -102,7 +99,11 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
             score=score,
             source="Browser Web Research",
             url=url,
-            metadata={"source_domain": urlparse(url).netloc},
+            metadata={
+                "source_domain": urlparse(url).netloc,
+                "collector_source_url": url,
+                "collector_source_text": text[:12000],
+            },
         ))
     return events
 
@@ -154,7 +155,11 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
             score=score_match.group(0).replace(" ", "") if score_match else None,
             source="Browser Web Research",
             url=url,
-            metadata={"source_domain": urlparse(url).netloc},
+            metadata={
+                "source_domain": urlparse(url).netloc,
+                "collector_source_url": url,
+                "collector_source_text": text[:12000],
+            },
         ))
     return events
 
@@ -174,7 +179,10 @@ async def collect(sport: Sport, mode: str) -> ResearchResult:
 
     unique: dict[tuple[str, str, str], Event] = {}
     for event in events:
-        unique[(event.name, event.url or "", event.mode)] = event
+        key = (event.name, event.start_time.isoformat() if event.start_time else "", event.mode)
+        if key not in unique:
+            unique[key] = event
+
     if not unique:
         errors.append(f"{sport}: real source pages produced no verified {mode} events")
     return ResearchResult(events=list(unique.values()), errors=errors)
