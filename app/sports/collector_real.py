@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from ..browser.research import browser_source_text
@@ -11,9 +11,20 @@ from .sources import sources_for
 _DATE_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>2026)")
 _TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
 
+# A calendar page does not itself say whether a match is currently LIVE.
+# Until we have a dedicated live-score source, use a conservative time window:
+# only matches that have already started today and started no more than 3h15m ago.
+# This prevents future scheduled games (tomorrow/next days) from being marked LIVE.
+LIVE_WINDOW = timedelta(hours=3, minutes=15)
+
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" -–—|·")
+
+
+def _is_live_time(start_time: datetime, now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    return start_time <= now <= start_time + LIVE_WINDOW and start_time.date() == now.date()
 
 
 def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
@@ -21,6 +32,7 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
     events: list[Event] = []
     current_date: str | None = None
     separators = {"-", "–", "—"}
+    now = datetime.now()
 
     for i, line in enumerate(lines):
         date_match = _DATE_RE.fullmatch(line)
@@ -46,14 +58,23 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
         home, away = candidates[0], candidates[1]
         if len(home) > 80 or len(away) > 80:
             continue
-        if mode == "prematch" and current_date < datetime.now().strftime("%Y-%m-%d"):
-            continue
+
+        start_time = datetime.fromisoformat(
+            f"{current_date}T{int(time_match.group(1)):02d}:{time_match.group(2)}"
+        )
+
+        if mode == "prematch":
+            if start_time < now:
+                continue
+        elif mode == "live":
+            if not _is_live_time(start_time, now):
+                continue
 
         events.append(Event(
             sport="khl",
             mode=mode,  # type: ignore[arg-type]
             name=f"{home} — {away}",
-            start_time=datetime.fromisoformat(f"{current_date}T{int(time_match.group(1)):02d}:{time_match.group(2)}"),
+            start_time=start_time,
             status="LIVE" if mode == "live" else None,
             source="Browser Web Research",
             url=url,
@@ -66,6 +87,7 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
     lines = [_clean(x) for x in text.splitlines() if _clean(x)]
     events: list[Event] = []
     current_date: str | None = None
+    now = datetime.now()
 
     for i, line in enumerate(lines):
         match = re.search(r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*-\s*(\d{4}-\d{2}-\d{2})", line)
@@ -91,14 +113,20 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
                     break
         if len(rest) < 3 or any(x in rest.lower() for x in ("matches for you", "event guide", "set filters")):
             continue
-        if mode == "prematch" and current_date < datetime.now().strftime("%Y-%m-%d"):
-            continue
+
+        start_time = datetime.fromisoformat(f"{current_date}T{tm.group(1)}")
+        if mode == "prematch":
+            if start_time < now:
+                continue
+        elif mode == "live":
+            if not _is_live_time(start_time, now):
+                continue
 
         events.append(Event(
             sport=sport,
             mode=mode,  # type: ignore[arg-type]
             name=rest[:180],
-            start_time=datetime.fromisoformat(f"{current_date}T{tm.group(1)}"),
+            start_time=start_time,
             status="LIVE" if mode == "live" else None,
             source="Browser Web Research",
             url=url,
