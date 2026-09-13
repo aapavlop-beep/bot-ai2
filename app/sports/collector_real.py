@@ -10,11 +10,6 @@ from .sources import sources_for
 
 _DATE_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>2026)")
 _TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
-
-# A calendar page does not itself say whether a match is currently LIVE.
-# Until we have a dedicated live-score source, use a conservative time window:
-# only matches that have already started today and started no more than 3h15m ago.
-# This prevents future scheduled games (tomorrow/next days) from being marked LIVE.
 LIVE_WINDOW = timedelta(hours=3, minutes=15)
 
 
@@ -25,6 +20,26 @@ def _clean(value: str) -> str:
 def _is_live_time(start_time: datetime, now: datetime | None = None) -> bool:
     now = now or datetime.now()
     return start_time <= now <= start_time + LIVE_WINDOW and start_time.date() == now.date()
+
+
+def _allowed_for_mode(start_time: datetime, mode: str, now: datetime) -> bool:
+    today = now.date()
+    last_allowed = today + timedelta(days=2)
+
+    # We only show the three nearest calendar days: today, tomorrow, day after tomorrow.
+    if start_time.date() < today or start_time.date() > last_allowed:
+        return False
+
+    if mode == "prematch":
+        # A match that already started/finished today is no longer PREMATCH.
+        return start_time > now
+
+    if mode == "live":
+        # A calendar entry is considered LIVE only while its start time is inside
+        # the conservative live window. Future matches are never marked LIVE.
+        return _is_live_time(start_time, now)
+
+    return False
 
 
 def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
@@ -62,13 +77,8 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
         start_time = datetime.fromisoformat(
             f"{current_date}T{int(time_match.group(1)):02d}:{time_match.group(2)}"
         )
-
-        if mode == "prematch":
-            if start_time < now:
-                continue
-        elif mode == "live":
-            if not _is_live_time(start_time, now):
-                continue
+        if not _allowed_for_mode(start_time, mode, now):
+            continue
 
         events.append(Event(
             sport="khl",
@@ -115,12 +125,8 @@ def _parse_esports(text: str, sport: Sport, url: str, mode: str) -> list[Event]:
             continue
 
         start_time = datetime.fromisoformat(f"{current_date}T{tm.group(1)}")
-        if mode == "prematch":
-            if start_time < now:
-                continue
-        elif mode == "live":
-            if not _is_live_time(start_time, now):
-                continue
+        if not _allowed_for_mode(start_time, mode, now):
+            continue
 
         events.append(Event(
             sport=sport,
