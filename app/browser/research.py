@@ -58,7 +58,7 @@ async def browser_source_text(url: str, timeout_ms: int = 30_000) -> str:
             timezone_id="Europe/Moscow",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+                "AppleWebKit/537.36 Chrome/140 Safari/140"
             ),
         )
         page = await context.new_page()
@@ -99,16 +99,11 @@ async def browser_search(query: str, engine: str = "yandex") -> list[dict[str, s
             await browser.close()
 
 
-async def browser_search_pages(
+async def _browser_search_pages_engine(
     query: str,
-    max_pages: int = 5,
-    engine: str = "yandex",
+    max_pages: int,
+    engine: str,
 ) -> list[tuple[str, str]]:
-    """Discover URLs with browser search, then open URLs and read their pages.
-
-    Search snippets are discarded. Only text returned by opened source pages
-    is returned to the caller.
-    """
     urls = {
         "yandex": "https://yandex.ru/search/?text=",
         "google": "https://www.google.com/search?q=",
@@ -160,7 +155,7 @@ async def browser_search_pages(
                     continue
                 seen.add(url)
                 candidates.append(url)
-                if len(candidates) >= max_pages * 3:
+                if len(candidates) >= max_pages * 4:
                     break
 
             page = await context.new_page()
@@ -184,3 +179,32 @@ async def browser_search_pages(
             await browser.close()
 
     return result
+
+
+async def browser_search_pages(
+    query: str,
+    max_pages: int = 5,
+    engine: str = "yandex",
+) -> list[tuple[str, str]]:
+    """Discover URLs with browser search, then open real pages and read them.
+
+    Search snippets are discarded. If Yandex returns too little usable material,
+    Google is used as a second discovery engine. The caller still receives only
+    text from pages that were actually opened.
+    """
+    result = await _browser_search_pages_engine(query, max_pages, engine)
+    if len(result) < max(2, max_pages // 2):
+        fallback_engine = "google" if engine == "yandex" else "yandex"
+        try:
+            extra = await _browser_search_pages_engine(query, max_pages, fallback_engine)
+        except Exception:
+            extra = []
+        seen = {url for url, _ in result}
+        for item in extra:
+            if item[0] in seen:
+                continue
+            result.append(item)
+            seen.add(item[0])
+            if len(result) >= max_pages:
+                break
+    return result[:max_pages]
