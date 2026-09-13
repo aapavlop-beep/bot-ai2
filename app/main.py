@@ -11,6 +11,7 @@ from .analysis.ai import analyze
 from .config import settings
 from .sports.catalog import SPORTS
 from .sports.collector_real import collect
+from .sports.enrichment import enrich_event
 
 
 dp = Dispatcher()
@@ -135,7 +136,6 @@ def _empty_message(title: str, mode: str, errors: list[str]) -> str:
             "Возможно, сегодняшние матчи уже завершились или прямо сейчас нет матчей в LIVE."
         )
 
-    # Не показываем пользователю внутренние ошибки парсера/браузера.
     if errors and any("ConnectTimeout" in error or "Browser" in error for error in errors):
         return (
             f"<b>{escape(title)} — PREMATCH</b>\n\n"
@@ -224,8 +224,8 @@ async def select_event(callback: CallbackQuery) -> None:
     _, sport, mode, index_text = callback.data.split(":", 3)
     title = next(item.title for item in SPORTS if item.key == sport)
 
-    await callback.answer("Проверяю матч и переданные данные…")
-    await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Обновляю данные матча через браузер…")
+    await callback.answer("Собираю статистику, форму и линию с реальных страниц…")
+    await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Собираю фактические данные по матчу через браузер…")
 
     result = await collect(sport, mode)
     if not result.events:
@@ -252,9 +252,11 @@ async def select_event(callback: CallbackQuery) -> None:
         return
 
     event = events[index]
+    event = await enrich_event(event)
     time_text = event.start_time.strftime("%d.%m.%Y %H:%M") if event.start_time else "время н/д"
     status_text = event.status or "PREMATCH"
     score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
+    pages = event.metadata.get("research_page_count", "0")
 
     try:
         analysis = await analyze([event])
@@ -264,7 +266,8 @@ async def select_event(callback: CallbackQuery) -> None:
     text = (
         f"<b>{escape(event.name)}</b>\n"
         f"🗓 {time_text}\n"
-        f"📌 {escape(status_text)}{score_text}\n\n"
+        f"📌 {escape(status_text)}{score_text}\n"
+        f"🌐 Реально открыто страниц: {escape(pages)}\n\n"
         f"<b>AI-анализ:</b>\n{escape(analysis[:3500])}"
     )
     await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event, index))
