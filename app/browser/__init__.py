@@ -1,0 +1,1 @@
+"""Browser-only research layer."""
