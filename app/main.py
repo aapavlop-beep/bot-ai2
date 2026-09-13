@@ -4,6 +4,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from .analysis.ai import analyze
 from .config import settings
 from .sports.catalog import SPORTS
 from .sports.collector_real import collect
@@ -34,6 +35,34 @@ def sport_menu(sport: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Все виды спорта", callback_data="home")],
         ]
     )
+
+
+def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
+    rows = []
+    for index, event in enumerate(events[:15]):
+        live = "🔴 " if event.status == "LIVE" else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{live}{event.name[:55]}",
+                callback_data=f"event:{sport}:{mode}:{index}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"collect:{sport}:{mode}"),
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sport:{sport}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def event_menu(sport: str, mode: str, event) -> InlineKeyboardMarkup:
+    rows = []
+    if event.url:
+        rows.append([InlineKeyboardButton(text="🌐 Открыть источник", url=event.url)])
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить матч", callback_data=f"event:{sport}:{mode}:refresh"),
+        InlineKeyboardButton(text="⬅️ К матчам", callback_data=f"collect:{sport}:{mode}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.message(CommandStart())
@@ -93,8 +122,62 @@ async def collect_sport(callback: CallbackQuery) -> None:
         time_text = event.start_time.strftime("%d.%m %H:%M") if event.start_time else "время н/д"
         live = " 🔴 LIVE" if event.status == "LIVE" else ""
         lines.append(f"• {event.name[:180]} — {time_text}{live}")
-    lines.append("\nИсточник событий: Browser Web Research → реальные страницы источников.")
-    await callback.message.edit_text("\n".join(lines), reply_markup=sport_menu(sport))
+    lines.append("\nНажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=event_list_menu(sport, mode, result.events),
+    )
+
+
+@dp.callback_query(F.data.startswith("event:"))
+async def select_event(callback: CallbackQuery) -> None:
+    _, sport, mode, index_text = callback.data.split(":", 3)
+    title = next(item.title for item in SPORTS if item.key == sport)
+
+    await callback.answer("Проверяю матч и переданные данные…")
+    await callback.message.edit_text(f"<b>{title}</b>\n\n🔎 Обновляю данные матча через браузер…")
+
+    result = await collect(sport, mode)
+    if not result.events:
+        await callback.message.edit_text(
+            f"<b>{title}</b>\n\nМатч больше не найден в источниках.\n\n"
+            "Это означает, что бот не будет придумывать данные или коэффициенты.",
+            reply_markup=sport_menu(sport),
+        )
+        return
+
+    if index_text == "refresh":
+        index = 0
+    else:
+        try:
+            index = int(index_text)
+        except ValueError:
+            index = 0
+
+    if index >= len(result.events):
+        await callback.message.edit_text(
+            f"<b>{title}</b>\n\nСписок матчей изменился. Нажмите «К матчам» и выберите матч заново.",
+            reply_markup=sport_menu(sport),
+        )
+        return
+
+    event = result.events[index]
+    time_text = event.start_time.strftime("%d.%m.%Y %H:%M") if event.start_time else "время н/д"
+    status_text = event.status or "PREMATCH"
+    score_text = f"\n🏒 Счёт: {event.score}" if event.score else ""
+
+    try:
+        analysis = await analyze([event])
+    except Exception as exc:
+        analysis = f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
+
+    text = (
+        f"<b>{event.name}</b>\n"
+        f"🗓 {time_text}\n"
+        f"📌 {status_text}{score_text}\n\n"
+        f"<b>AI-анализ:</b>\n{analysis[:3500]}"
+    )
+    await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event))
 
 
 @dp.callback_query(F.data.startswith("mode:"))
