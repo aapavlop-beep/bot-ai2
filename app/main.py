@@ -6,7 +6,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from .config import settings
 from .sports.catalog import SPORTS
-from .sports.collector import collect
+from .sports.collector_real import collect
 
 
 dp = Dispatcher()
@@ -42,8 +42,8 @@ async def start(message: Message) -> None:
         "<b>AI Sports Analyst</b>\n\n"
         "🏒 КХЛ  •  🎮 Dota 2  •  🎯 CS2\n"
         "📅 PREMATCH + 🔴 LIVE\n\n"
-        "Сбор данных выполняется через браузерный web research.\n"
-        "AI не получает право придумывать матчи, счета или коэффициенты.",
+        "Сбор событий выполняется непосредственно со страниц источников через браузер.\n"
+        "Поисковые сниппеты не считаются матчами. AI не получает право придумывать матчи, счета или коэффициенты.",
         reply_markup=main_menu(),
     )
 
@@ -72,7 +72,7 @@ async def select_sport(callback: CallbackQuery) -> None:
 async def collect_sport(callback: CallbackQuery) -> None:
     _, sport, mode = callback.data.split(":", 2)
     title = next(item.title for item in SPORTS if item.key == sport)
-    await callback.answer("Запускаю браузерный поиск…")
+    await callback.answer("Читаю страницы источников через браузер…")
     await callback.message.edit_text(f"<b>{title}</b>\n\n🔎 Browser Web Research…")
 
     result = await collect(sport, mode)
@@ -82,16 +82,18 @@ async def collect_sport(callback: CallbackQuery) -> None:
             error_text = "\n\nТехнические ошибки:\n" + "\n".join(result.errors[:3])
         await callback.message.edit_text(
             f"<b>{title}</b>\n\n"
-            f"Результаты, подтверждающие события, не найдены.\n"
+            f"Подтверждённых матчей на реальных страницах источников не найдено.\n"
             f"Источник: Browser Web Research{error_text}",
             reply_markup=sport_menu(sport),
         )
         return
 
-    lines = [f"<b>{title} — {mode.upper()}</b>", "", "Найденные web-результаты:"]
-    for event in result.events[:10]:
-        lines.append(f"• {event.name[:180]}")
-    lines.append("\n⚠️ Это сырой этап поиска. Матч считается подтверждённым только после специализированного парсера.")
+    lines = [f"<b>{title} — {mode.upper()}</b>", "", "Подтверждённые матчи из источников:"]
+    for event in result.events[:15]:
+        time_text = event.start_time.strftime("%d.%m %H:%M") if event.start_time else "время н/д"
+        live = " 🔴 LIVE" if event.status == "LIVE" else ""
+        lines.append(f"• {event.name[:180]} — {time_text}{live}")
+    lines.append("\nИсточник событий: Browser Web Research → реальные страницы источников.")
     await callback.message.edit_text("\n".join(lines), reply_markup=sport_menu(sport))
 
 
