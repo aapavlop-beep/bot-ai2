@@ -10,6 +10,7 @@ from .models import Event, ResearchResult, Sport
 from .sources import sources_for
 
 _DATE_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>2026)")
+_DATETIME_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>2026)\s+(?P<h>\d{1,2}):(?P<min>\d{2})")
 _TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
 _SCORE_RE = re.compile(r"\b\d{1,2}\s*[:\-]\s*\d{1,2}\b")
 LIVE_WORDS = ("live", "в эфире", "сейчас", "1-й период", "2-й период", "3-й период", "1 период", "2 период", "3 период", "перерыв", "овертайм")
@@ -49,7 +50,58 @@ def _is_explicit_live(lines: list[str], index: int) -> tuple[bool, str | None]:
     return True, score_match.group(0).replace(" ", "") if score_match else None
 
 
+def _make_khl_event(
+    current_date: str,
+    hour: int,
+    minute: int,
+    home: str,
+    away: str,
+    mode: str,
+    url: str,
+    text: str,
+    lines: list[str],
+    index: int,
+    now: datetime,
+) -> Event | None:
+    start_time = datetime.fromisoformat(
+        f"{current_date}T{hour:02d}:{minute:02d}"
+    )
+    explicit_live, score = _is_explicit_live(lines, index)
+    if not _allowed_for_mode(start_time, mode, now, explicit_live):
+        return None
+
+    return Event(
+        sport="khl",
+        mode=mode,  # type: ignore[arg-type]
+        name=f"{home} — {away}",
+        start_time=start_time,
+        status="LIVE" if explicit_live else None,
+        score=score,
+        source="Browser Web Research",
+        url=url,
+        metadata={
+            "source_domain": urlparse(url).netloc,
+            "collector_source_url": url,
+            "collector_source_text": text[:12000],
+        },
+    )
+
+
 def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
+    """Parse the actual Sports.ru/Championat calendar layout.
+
+    Sports.ru currently exposes matches as:
+        14.09.2026 18:00
+        Лада
+        -
+        -
+        -
+        Динамо Минск
+
+    Older/alternate pages may put the date on its own line, so both layouts
+    are supported. A match is accepted only if its date/time is in the
+    requested window and, for LIVE, the page explicitly marks it as live.
+    """
     lines = [_clean(x) for x in text.splitlines() if _clean(x)]
     events: list[Event] = []
     current_date: str | None = None
@@ -57,54 +109,70 @@ def _parse_khl(text: str, url: str, mode: str) -> list[Event]:
     now = _now()
 
     for i, line in enumerate(lines):
-        date_match = _DATE_RE.fullmatch(line)
-        if date_match:
-            current_date = f"{date_match.group('y')}-{int(date_match.group('m')):02d}-{int(date_match.group('d')):02d}"
-            continue
-        time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", line)
-        if not time_match or not current_date:
+        # Current Sports.ru layout: date and time are on the same line.
+        dt_match = _DATETIME_RE.search(line)
+        if dt_match:
+            current_date = (
+                f"{dt_match.group('y')}-{int(dt_match.group('m')):02d}-{int(dt_match.group('d')):02d}"
+            )
+            hour = int(dt_match.group("h"))
+            minute = int(dt_match.group("min"))
+        else:
+            date_match = _DATE_RE.fullmatch(line)
+            if date_match:
+                current_date = (
+                    f"{date_match.group('y')}-{int(date_match.group('m')):02d}-{int(date_match.group('d')):02d}"
+                )
+                continue
+
+            if not current_date:
+                continue
+
+            time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", line)
+            if not time_match:
+                continue
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+
+        if not current_date:
             continue
 
         candidates: list[str] = []
-        for nxt in lines[i + 1 : i + 10]:
-            if _DATE_RE.fullmatch(nxt) or _TIME_RE.search(nxt):
+        for nxt in lines[i + 1 : i + 12]:
+            if _DATE_RE.fullmatch(nxt) or _DATETIME_RE.search(nxt) or _TIME_RE.search(nxt):
                 break
             if nxt in {"Дата и время", "Хозяева", "Счет", "Гости"} or nxt in separators:
                 continue
-            if nxt.lower() in {"завершен", "предстоящие", "live", "онлайн", "матч завершен"}:
+            if _SCORE_RE.fullmatch(nxt) or nxt.lower() in {"завершен", "предстоящие", "live", "онлайн", "матч завершен"}:
+                continue
+            # Sports.ru may expose team names with harmless navigation text;
+            # team names are short and do not contain these table markers.
+            if len(nxt) > 80:
                 continue
             candidates.append(nxt)
             if len(candidates) >= 2:
                 break
+
         if len(candidates) < 2:
             continue
 
         home, away = candidates[0], candidates[1]
-        if len(home) > 80 or len(away) > 80:
-            continue
-
-        start_time = datetime.fromisoformat(
-            f"{current_date}T{int(time_match.group(1)):02d}:{time_match.group(2)}"
-        )
-        explicit_live, score = _is_explicit_live(lines, i)
-        if not _allowed_for_mode(start_time, mode, now, explicit_live):
-            continue
-
-        events.append(Event(
-            sport="khl",
-            mode=mode,  # type: ignore[arg-type]
-            name=f"{home} — {away}",
-            start_time=start_time,
-            status="LIVE" if explicit_live else None,
-            score=score,
-            source="Browser Web Research",
+        event = _make_khl_event(
+            current_date=current_date,
+            hour=hour,
+            minute=minute,
+            home=home,
+            away=away,
+            mode=mode,
             url=url,
-            metadata={
-                "source_domain": urlparse(url).netloc,
-                "collector_source_url": url,
-                "collector_source_text": text[:12000],
-            },
-        ))
+            text=text,
+            lines=lines,
+            index=i,
+            now=now,
+        )
+        if event is not None:
+            events.append(event)
+
     return events
 
 
