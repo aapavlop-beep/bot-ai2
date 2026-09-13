@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from html import escape
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -41,6 +42,20 @@ def sport_menu(sport: str) -> InlineKeyboardMarkup:
     )
 
 
+def _now_for_event(event) -> datetime:
+    if event.start_time and event.start_time.tzinfo:
+        return datetime.now(event.start_time.tzinfo)
+    return datetime.now()
+
+
+def _event_visible(event, mode: str) -> bool:
+    if mode == "live":
+        return str(event.status or "").upper() in {"LIVE", "IN_PLAY", "IN_PROGRESS"}
+    if not event.start_time:
+        return False
+    return event.start_time >= _now_for_event(event)
+
+
 def _day_group(event, now: datetime) -> str:
     if not event.start_time:
         return "other"
@@ -59,8 +74,9 @@ def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
     now = datetime.now()
     grouped = {"today": [], "tomorrow": [], "day_after": []}
 
-    indexed_events = list(enumerate(events[:15]))
-    for index, event in indexed_events:
+    for index, event in enumerate(events):
+        if not _event_visible(event, mode):
+            continue
         group = _day_group(event, now)
         if group in grouped:
             grouped[group].append((index, event))
@@ -94,7 +110,23 @@ def event_list_menu(sport: str, mode: str, events) -> InlineKeyboardMarkup:
 def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup:
     rows = []
     if event.url:
-        rows.append([InlineKeyboardButton(text="🌐 Открыть источник", url=event.url)])
+        rows.append([InlineKeyboardButton(text="🌐 Открыть страницу матча", url=event.url)])
+
+    research_urls = str(event.metadata.get("research_urls", "")).splitlines()
+    source_buttons = []
+    seen_domains = set()
+    for url in research_urls:
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        if not domain or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        source_buttons.append(InlineKeyboardButton(text=f"🔎 {domain}", url=url))
+        if len(source_buttons) == 2:
+            rows.append(source_buttons)
+            source_buttons = []
+    if source_buttons:
+        rows.append(source_buttons)
+
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить матч", callback_data=f"event:{sport}:{mode}:{index}"),
         InlineKeyboardButton(text="⬅️ К матчам", callback_data=f"collect:{sport}:{mode}"),
@@ -102,10 +134,12 @@ def event_menu(sport: str, mode: str, event, index: int) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _format_event_list(events) -> list[str]:
+def _format_event_list(events, mode: str) -> list[str]:
     now = datetime.now()
     grouped: dict[str, list] = {"today": [], "tomorrow": [], "day_after": []}
-    for event in events[:15]:
+    for event in events:
+        if not _event_visible(event, mode):
+            continue
         group = _day_group(event, now)
         if group in grouped:
             grouped[group].append(event)
@@ -119,7 +153,7 @@ def _format_event_list(events) -> list[str]:
     for group in ("today", "tomorrow", "day_after"):
         if not grouped[group]:
             continue
-        lines.append(labels[group])
+        lines.append(f"{labels[group]}  •  {len(grouped[group])} матч(ей)")
         for event in grouped[group]:
             time_text = event.start_time.strftime("%H:%M") if event.start_time else "время н/д"
             live = " 🔴 LIVE" if event.status == "LIVE" else ""
@@ -132,22 +166,84 @@ def _empty_message(title: str, mode: str, errors: list[str]) -> str:
     if mode == "live":
         return (
             f"<b>{escape(title)} — LIVE</b>\n\n"
-            "🔴 Сейчас активных матчей не найдено.\n\n"
-            "Возможно, сегодняшние матчи уже завершились или прямо сейчас нет матчей в LIVE."
+            "🔴 <b>Сейчас активных матчей не найдено.</b>\n\n"
+            "Возможно, матчи уже завершились или прямо сейчас нет игр в LIVE."
         )
 
     if errors and any("ConnectTimeout" in error or "Browser" in error for error in errors):
         return (
             f"<b>{escape(title)} — PREMATCH</b>\n\n"
-            "⚠️ Сейчас не удалось получить актуальный список матчей с источников.\n"
-            "Нажмите «Обновить список» и попробуйте ещё раз."
+            "⚠️ <b>Не удалось получить актуальный список матчей.</b>\n\n"
+            "Источники временно не ответили. Нажмите «Обновить список»."
         )
 
     return (
         f"<b>{escape(title)} — PREMATCH</b>\n\n"
-        "📅 На сегодня новых матчей больше нет.\n"
+        "✅ <b>На сегодня новых матчей не осталось.</b>\n\n"
         "Все сегодняшние матчи уже начались или завершились."
     )
+
+
+def _analysis_text(analysis: dict) -> str:
+    verdict = str(analysis.get("verdict") or "SKIP").upper()
+    confidence = analysis.get("confidence", 0)
+    market = analysis.get("market")
+    odds = analysis.get("odds")
+    odds_source = analysis.get("odds_source")
+    estimated = analysis.get("estimated_probability")
+    implied = analysis.get("implied_probability")
+    edge = analysis.get("edge")
+    quality = str(analysis.get("data_quality") or "LOW").upper()
+    factors = analysis.get("factors") or []
+    risks = analysis.get("risks") or []
+    summary = str(analysis.get("summary") or "").strip()
+
+    verdict_view = {
+        "BET": "🟢 <b>BET — есть подтверждённый интерес</b>",
+        "WATCH": "🟡 <b>WATCH — наблюдать, но сейчас не ставить</b>",
+        "SKIP": "🔴 <b>SKIP — ставку пропускаем</b>",
+    }.get(verdict, "🔴 <b>SKIP — ставку пропускаем</b>")
+    quality_view = {"HIGH": "🟢 HIGH", "MEDIUM": "🟡 MEDIUM", "LOW": "🔴 LOW"}.get(quality, "🔴 LOW")
+
+    lines = [
+        "<b>🤖 AI-АНАЛИЗ</b>",
+        "",
+        verdict_view,
+        f"🎯 Уверенность в решении: <b>{escape(str(confidence))}/100</b>",
+        f"📊 Качество данных: <b>{quality_view}</b>",
+    ]
+
+    if market:
+        lines += ["", "<b>🎯 Рынок</b>", escape(str(market))]
+        if odds:
+            odds_line = f"💰 Коэффициент: <b>{escape(str(odds))}</b>"
+            if odds_source:
+                odds_line += f"\n   Источник: {escape(str(odds_source))}"
+            lines.append(odds_line)
+        else:
+            lines.append("⚠️ Линия не подтверждена — коэффициент не используем.")
+
+    if estimated or implied or edge:
+        lines += ["", "<b>📐 Оценка перевеса</b>"]
+        if estimated:
+            lines.append(f"• Оценка вероятности: {escape(str(estimated))}")
+        if implied:
+            lines.append(f"• Рыночная вероятность: {escape(str(implied))}")
+        if edge:
+            lines.append(f"• Перевес: <b>{escape(str(edge))}</b>")
+
+    if factors:
+        lines += ["", "<b>🔎 Ключевые факторы</b>"]
+        lines.extend(f"• {escape(str(item))}" for item in factors[:6])
+
+    if risks:
+        lines += ["", "<b>⚠️ Риски</b>"]
+        lines.extend(f"• {escape(str(item))}" for item in risks[:5])
+
+    if summary:
+        lines += ["", "<b>📌 Итог</b>", escape(summary)]
+
+    return "\n".join(lines)[:3800]
 
 
 @dp.message(CommandStart())
@@ -195,7 +291,8 @@ async def collect_sport(callback: CallbackQuery) -> None:
     await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Browser Web Research…")
 
     result = await collect(sport, mode)
-    if not result.events:
+    visible_events = [event for event in result.events if _event_visible(event, mode)]
+    if not visible_events:
         await callback.message.edit_text(
             _empty_message(title, mode, result.errors),
             reply_markup=sport_menu(sport),
@@ -203,15 +300,16 @@ async def collect_sport(callback: CallbackQuery) -> None:
         return
 
     events = sorted(
-        result.events,
+        visible_events,
         key=lambda event: event.start_time or datetime.max,
     )
     lines = [
         f"<b>{escape(title)} — {escape(mode.upper())}</b>",
         "",
-        "Подтверждённые матчи из источников:",
+        "<b>Подтверждённые матчи</b> — только с реальных страниц источников.",
+        "",
     ]
-    lines.extend(_format_event_list(events))
+    lines.extend(_format_event_list(events, mode))
     lines.append("Нажмите на матч ниже, чтобы открыть его и запустить AI-анализ.")
     await callback.message.edit_text(
         "\n".join(lines),
@@ -228,7 +326,8 @@ async def select_event(callback: CallbackQuery) -> None:
     await callback.message.edit_text(f"<b>{escape(title)}</b>\n\n🔎 Собираю фактические данные по матчу через браузер…")
 
     result = await collect(sport, mode)
-    if not result.events:
+    visible_events = [event for event in result.events if _event_visible(event, mode)]
+    if not visible_events:
         await callback.message.edit_text(
             _empty_message(title, mode, result.errors),
             reply_markup=sport_menu(sport),
@@ -236,7 +335,7 @@ async def select_event(callback: CallbackQuery) -> None:
         return
 
     events = sorted(
-        result.events,
+        visible_events,
         key=lambda event: event.start_time or datetime.max,
     )
     try:
@@ -258,19 +357,17 @@ async def select_event(callback: CallbackQuery) -> None:
     score_text = f"\n🏒 Счёт: {escape(event.score)}" if event.score else ""
     pages = event.metadata.get("research_page_count", "0")
 
-    try:
-        analysis = await analyze([event])
-    except Exception as exc:
-        analysis = f"AI-анализ временно недоступен: {type(exc).__name__}: {exc}"
+    analysis = await analyze([event])
+    analysis_block = _analysis_text(analysis)
 
     text = (
         f"<b>{escape(event.name)}</b>\n"
         f"🗓 {time_text}\n"
         f"📌 {escape(status_text)}{score_text}\n"
-        f"🌐 Реально открыто страниц: {escape(pages)}\n\n"
-        f"<b>AI-анализ:</b>\n{escape(analysis[:3500])}"
+        f"🌐 Открыто страниц исследования: <b>{escape(pages)}</b>\n\n"
+        f"{analysis_block}"
     )
-    await callback.message.edit_text(text, reply_markup=event_menu(sport, mode, event, index))
+    await callback.message.edit_text(text[:4000], reply_markup=event_menu(sport, mode, event, index))
 
 
 @dp.callback_query(F.data.startswith("mode:"))
