@@ -6,11 +6,13 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .analysis.ai import analyze
-from .config import settings
+from .config import configuration_warnings, settings
+from .service import SearchService
+from .storage import Store
 from .sports.catalog import SPORTS
 from .sports.collector_real import collect
 from .sports.enrichment import enrich_event
@@ -18,6 +20,24 @@ from .sports.enrichment import enrich_event
 
 dp = Dispatcher()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+store = Store(settings.database_path, settings.timezone)
+bot_instance: Bot | None = None
+
+
+async def notify_search(user_id: int, chat_id: int, items: list[dict], message: str) -> None:
+    if bot_instance is None:
+        return
+    rows = []
+    for item in items[:5]:
+        rec_id = str(item.get("id", ""))
+        if rec_id:
+            rows.append([InlineKeyboardButton(text=f"➕ {item.get('event_name', 'Вариант')[:45]}", callback_data=f"rec:add:{rec_id}")])
+    if items:
+        rows.append([InlineKeyboardButton(text="🧺 Открыть выбранные", callback_data="rec:cart")])
+    await bot_instance.send_message(chat_id, message[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+
+
+search_service = SearchService(store, notify_search)
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -265,6 +285,84 @@ async def start(message: Message) -> None:
     )
 
 
+@dp.message(Command("bank"))
+async def bank_command(message: Message) -> None:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /bank 1000 [лимит_потерь]")
+        return
+    try:
+        bank = store.set_bank(message.from_user.id, float(parts[1]), float(parts[2]) if len(parts) > 2 else None)
+    except (ValueError, IndexError) as exc:
+        await message.answer(str(exc))
+        return
+    await message.answer(f"Банк на сегодня: {bank['available']:.2f} ₽. Доступно после ставок: {bank['available']:.2f} ₽.")
+
+
+@dp.message(Command("stop"))
+async def stop_command(message: Message) -> None:
+    await search_service.stop(message.from_user.id)
+    await message.answer("Поиск остановлен.")
+
+
+@dp.message(Command("search"))
+async def search_command(message: Message) -> None:
+    """Start the durable search service: /search prematch khl,dota2 or /search live khl."""
+    parts = (message.text or "").split()
+    mode = parts[1].lower() if len(parts) > 1 else "prematch"
+    sports = [item.strip().lower() for item in (parts[2] if len(parts) > 2 else "khl,dota2,cs2").split(",") if item.strip()]
+    try:
+        await search_service.start(message.from_user.id, message.chat.id, sports, mode)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    await message.answer(f"Поиск запущен: {mode.upper()} — {', '.join(sports)}. Остановить: /stop")
+
+
+@dp.message(Command("history"))
+async def history_command(message: Message) -> None:
+    items = store.history(message.from_user.id, limit=10)
+    if not items:
+        await message.answer("История ставок пока пуста.")
+        return
+    lines = ["<b>История ставок</b>"]
+    for item in items:
+        lines.append(f"• {escape(str(item.get('event_name', 'Матч'))[:80])}: {item.get('stake', 0):.2f} ₽ @ {item.get('odds', '-')}, {escape(str(item.get('status', 'pending')))}")
+    await message.answer("\n".join(lines))
+
+
+@dp.callback_query(F.data.startswith("rec:"))
+async def recommendation_action(callback: CallbackQuery) -> None:
+    _, action, *rest = callback.data.split(":")
+    user_id = callback.from_user.id
+    try:
+        if action == "add" and rest:
+            store.add_to_cart(user_id, rest[0])
+            await callback.answer("Добавлено в выбранные")
+        elif action == "cart":
+            items = store.cart(user_id)
+            if not items:
+                await callback.message.answer("Выбранные ставки пусты.")
+            else:
+                total = sum(float(item.get("stake", 0)) for item in items)
+                await callback.message.answer(f"В выбранных ставок: {len(items)}, сумма {total:.2f} ₽. Подтвердить: /confirm")
+                await callback.answer()
+        else:
+            await callback.answer("Неизвестное действие", show_alert=True)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+
+
+@dp.message(Command("confirm"))
+async def confirm_command(message: Message) -> None:
+    try:
+        placed = store.confirm_cart(message.from_user.id)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    await message.answer(f"Записано ставок: {len(placed)}. Сумма списана из доступного банка; результаты внесите через историю.")
+
+
 @dp.callback_query(F.data == "home")
 async def home(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
@@ -402,14 +500,22 @@ async def select_mode(callback: CallbackQuery) -> None:
 
 
 async def main() -> None:
+    global bot_instance
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    bot_instance = bot
     try:
         print("BOT STARTED", flush=True)
+        for warning in configuration_warnings():
+            print(f"CONFIG WARNING: {warning}", flush=True)
+        await search_service.restore()
         await dp.start_polling(bot)
     finally:
+        await search_service.close()
+        store.close()
+        bot_instance = None
         await bot.session.close()
 
 

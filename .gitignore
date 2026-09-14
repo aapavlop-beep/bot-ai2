@@ -6,3 +6,7 @@ __pycache__/
 .mypy_cache/
 ruff_cache/
 data/*.db
+data/*.db-*
+data/*.sqlite*
+.coverage
+tests/*.db
