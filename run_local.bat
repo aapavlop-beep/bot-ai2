@@ -7,5 +7,9 @@ if not exist .env (
   exit /b 1
 )
 
-python -m app.main
+if exist .venv\Scripts\python.exe (
+  .venv\Scripts\python.exe -m app.main
+) else (
+  py -3 -m app.main
+)
 pause

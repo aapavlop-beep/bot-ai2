@@ -160,11 +160,72 @@ def _normalize(data: dict, event: Event) -> dict:
     return result
 
 
+def build_options(completed: list[tuple[Event, dict]], available_bank: float, limit: int = 100) -> list[dict]:
+    """Turn completed analyses into conservative, actionable recommendations."""
+    if available_bank <= 0 or limit <= 0:
+        return []
+
+    options: list[dict] = []
+    for event, analysis in completed:
+        if str(analysis.get("verdict") or "SKIP").upper() != "BET":
+            continue
+        market = analysis.get("market")
+        odds = analysis.get("odds")
+        try:
+            bookmaker_count = int(event.metadata.get("bookmaker_count", "0") or 0)
+            odds_value = float(str(odds).replace(",", "."))
+            confidence = int(analysis.get("confidence", 0))
+            edge = float(str(analysis.get("edge")).replace(",", ".")) if analysis.get("edge") is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if not market or bookmaker_count <= 0 or not 1 < odds_value <= 1_000_000:
+            continue
+        if confidence < 1 or edge <= 0:
+            continue
+
+        stake = round(min(available_bank * 0.02, available_bank), 2)
+        if stake <= 0:
+            continue
+        options.append({
+            "event_id": event.id,
+            "event_name": event.name,
+            "sport": event.sport,
+            "mode": event.mode,
+            "start_time": event.start_time.isoformat() if event.start_time else None,
+            "status": event.status,
+            "market": str(market),
+            "odds": odds_value,
+            "odds_source": analysis.get("odds_source"),
+            "verdict": "BET",
+            "confidence": confidence,
+            "estimated_probability": analysis.get("estimated_probability"),
+            "implied_probability": analysis.get("implied_probability"),
+            "edge": analysis.get("edge"),
+            "data_quality": analysis.get("data_quality"),
+            "factors": analysis.get("factors") or [],
+            "risks": analysis.get("risks") or [],
+            "data_gaps": analysis.get("data_gaps") or [],
+            "summary": analysis.get("summary") or "",
+            "stake": stake,
+        })
+
+    options.sort(key=lambda item: (
+        float(str(item.get("edge") or 0).replace(",", ".")),
+        int(item.get("confidence") or 0),
+    ), reverse=True)
+    return options[:limit]
+
+
 async def analyze(events: list[Event]) -> dict:
     if not events:
         return _fallback("Нет матча для анализа")
     if not settings.openai_api_key:
         return _fallback("OPENAI_API_KEY не задан в .env")
+    if settings.openai_api_key.strip() == settings.bot_token.strip():
+        return _fallback(
+            "OPENAI_API_KEY совпадает с BOT_TOKEN. Проверь переменные окружения: "
+            "переменная Windows OPENAI_API_KEY может перекрывать значение из .env."
+        )
 
     # Do not spend an AI request on an event for which browser research failed.
     try:
